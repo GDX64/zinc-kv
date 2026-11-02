@@ -16,7 +16,7 @@ Cargo workspace (`Cargo.toml` at root, shared `[workspace.dependencies]`), crate
 Entire DB = one object `<prefix>/state.json`: `{ epoch: u64, entries: { key: { value: base64, version: u64 } } }`.
 - Read: GET, parse, keep ETag/version from `GetResult.meta`.
 - Write: read-modify-write, `PutMode::Update(UpdateVersion{e_tag, version})`; first write uses `PutMode::Create`. On `Error::Precondition`/`AlreadyExists` → reload and retry (bounded, jittered).
-- API: `Db::open(Arc<dyn ObjectStore>, Path)`, `get`, `put`, `delete`, `cas(key, expected: Option<u64>, new: Option<Bytes>) -> Result<u64, CasError>`. Key version = `epoch` of the commit that last wrote it; `expected: None` = must not exist (lock/leader election).
+- API: `Db::open(Arc<dyn ObjectStore>, Path)`, `get`, `put`, `delete`, `cas(key, expected: Option<Version>, new: Option<Bytes>) -> Result<Version, CasError>`. `Version` is a newtype (`#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)] struct Version(u64)`, transparent in JSON), not a raw `u64`; `put` also returns `Version` and `Entry.version: Version`. Key version = `epoch` of the commit that last wrote it; `expected: None` = must not exist (lock/leader election).
 - Backends under test: `InMemory`, `LocalFileSystem`.
 - Files: `Cargo.toml` (object_store, tokio, bytes, serde, serde_json, base64, thiserror, rand), `src/lib.rs`, `src/state.rs`, `src/error.rs`, `tests/`.
 - **Done when**: concurrency tests pass (below). Known limit: whole state rewritten per write — fine for small coordination data.
