@@ -24,6 +24,8 @@ pub use types::{Entry, Version};
 use commit::{Commit, Op};
 
 const MAX_ATTEMPTS: u32 = 64;
+/// Commits a single head lookup may find past the listing before giving up.
+const MAX_PROBES: u64 = 64;
 const BACKOFF_BASE: Duration = Duration::from_millis(1);
 const BACKOFF_CAP: Duration = Duration::from_millis(32);
 
@@ -133,7 +135,8 @@ impl Db {
         payload: Bytes,
         uncertain: &mut Vec<u64>,
     ) -> std::result::Result<Version, CasError> {
-        // Commits up to `checked` are already reflected in `current`.
+        // Commits up to `checked` are already reflected in `current` (for `cas`), and the
+        // head we append after has been decoded (for all writes).
         let mut checked = 0;
         let mut current = None;
         let mut last_error: Option<StoreError> = None;
@@ -149,14 +152,22 @@ impl Db {
             }
 
             if let Some(expected) = expected {
+                // Scans newest first, so this decodes the head commit too.
                 if let Some(found) = self.find(checked + 1..=head, key).await? {
                     current = found.live_version();
                 }
-                checked = head;
                 if expected != current {
                     return Err(CasError::Conflict { current });
                 }
+            } else if head > checked {
+                // Never append after a commit we cannot read: it may be damaged, or in a
+                // newer format whose rules this writer does not know. Every writer checks
+                // this, so once a newer format is at the head, older writers stop.
+                self.read_commit(head)
+                    .await?
+                    .ok_or(Error::MissingCommit { number: head })?;
             }
+            checked = head;
 
             let number = head + 1;
             match self.create_commit(number, payload.clone()).await {
@@ -238,9 +249,15 @@ impl Db {
                 return Err(Error::MissingCommit { number: expected });
             }
         }
-        let mut head = numbers.len() as u64;
+        let listed = numbers.len() as u64;
+        let mut head = listed;
         while self.exists(head + 1).await? {
             head += 1;
+            // Appends are outpacing us. Stopping at a head not confirmed as current would
+            // give stale answers, so give up instead.
+            if head - listed >= MAX_PROBES {
+                return Err(Error::Contention);
+            }
         }
         Ok(head)
     }

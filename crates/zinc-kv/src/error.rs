@@ -16,7 +16,9 @@ pub enum Error {
     },
     #[error("commit {number} has unsupported format version {version}")]
     UnsupportedFormat { number: u64, version: u64 },
-    #[error("gave up after repeated write conflicts")]
+    /// Concurrent writers kept winning: repeated lost races, or a log growing faster than
+    /// the current head could be confirmed.
+    #[error("gave up under contention from concurrent writers")]
     Contention,
     /// The write may or may not have been applied: an attempt failed in a way that could
     /// still have written its commit (now or later), and that could not be settled.

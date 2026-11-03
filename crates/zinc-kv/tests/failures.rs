@@ -388,3 +388,73 @@ async fn endless_contention_gives_up() {
         assert_eq!(db.get("k").await.unwrap(), None, "{backend:?}");
     }
 }
+
+/// Unconditional writes read nothing for their own result, but must still refuse to append
+/// after a head commit they cannot read: damaged, or in a newer format.
+#[tokio::test]
+async fn unconditional_writes_reject_an_unreadable_head() {
+    for backend in BACKENDS {
+        for (label, contents) in [
+            ("future", r#"{"v":2,"anything":[1,2]}"#),
+            ("corrupt", "not json"),
+        ] {
+            for delete in [false, true] {
+                let inner = store(backend, &format!("unreadable_head_{label}_{delete}"));
+                inner
+                    .put(
+                        &Path::from(format!("{PREFIX}/log/{}", commit_name(1))),
+                        text(contents).into(),
+                    )
+                    .await
+                    .unwrap();
+                let db = open(&inner).await;
+
+                let result = if delete {
+                    db.delete("leader").await
+                } else {
+                    db.put("leader", text("me")).await.map(|_| ())
+                };
+                let ctx = format!("{backend:?}/{label}/delete={delete}");
+                match label {
+                    "future" => assert!(
+                        matches!(result, Err(Error::UnsupportedFormat { number: 1, version: 2 })),
+                        "{ctx}: {result:?}"
+                    ),
+                    _ => assert!(
+                        matches!(result, Err(Error::Corrupt { number: 1, .. })),
+                        "{ctx}: {result:?}"
+                    ),
+                }
+                assert_eq!(log_files(&inner).await, [commit_name(1)], "{ctx}");
+            }
+        }
+    }
+}
+
+/// A competitor appends a commit before every forward probe, so the head is never
+/// confirmed. Reads and writes must give up with `Contention` after bounded work.
+#[tokio::test]
+async fn continuous_appends_end_in_contention() {
+    for backend in BACKENDS {
+        for write in [false, true] {
+            let inner = store(backend, &format!("moving_head_{write}"));
+            let faulty = FaultStore::new(inner);
+            faulty.append_on_every_head();
+            let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+
+            let result = tokio::time::timeout(Duration::from_secs(30), async {
+                if write {
+                    db.put("k", text("value")).await.map(|_| ())
+                } else {
+                    db.get("k").await.map(|_| ())
+                }
+            })
+            .await
+            .expect("head discovery must be bounded");
+            let ctx = format!("{backend:?}/write={write}");
+            assert!(matches!(result, Err(Error::Contention)), "{ctx}: {result:?}");
+            assert!(faulty.head_probes() <= 100, "{ctx}: {} probes", faulty.head_probes());
+            assert_eq!(faulty.creates(), 0, "{ctx}");
+        }
+    }
+}

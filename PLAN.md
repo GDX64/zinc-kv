@@ -68,6 +68,7 @@ Tests (each on both backends unless noted):
   13. `Create` fails, then the request lands before the next listing → claimed as ours: no duplicate, no `Conflict`.
   14. Listing fails → error returned.
   15. Every number is stolen by a competitor → `Contention` after a bounded time.
+  - Second review: unconditional writes now decode the head commit before appending (a damaged or newer-format head → `Corrupt`/`UnsupportedFormat`, log unchanged; this is also what stops older writers once a newer format appears). Forward head probing is capped at `MAX_PROBES` past the listing → `Contention`, never an unconfirmed head. Tests: `unconditional_writes_reject_an_unreadable_head`, `continuous_appends_end_in_contention`.
   - Review findings, now regular tests: the final attempt's `Create` lands but reports a failure (error, `AlreadyExists`, delayed) → recognised as success, retry limit measured not assumed; unknown fields inside an op → `Corrupt`; a lagging listing → reads and `cas` see the current state, no false `Conflict` (`commit_path.rs`); `Create` failing at numbers taken by others → plain store error, not `OutcomeUnknown`.
 - **Concurrency** (`tests/concurrency.rs`, both backends)
   16. Counter and lock tests.

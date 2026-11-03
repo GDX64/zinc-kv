@@ -105,6 +105,8 @@ struct Faults {
     vanished: Option<String>,
     listing_head: Option<u64>,
     creates: usize,
+    append_on_head: bool,
+    head_probes: usize,
 }
 
 /// Wraps a store and injects faults into `PutMode::Create` and listing.
@@ -168,6 +170,15 @@ impl FaultStore {
     /// Number of `Create` calls received so far.
     pub fn creates(&self) -> usize {
         self.faults.lock().unwrap().creates
+    }
+
+    /// Simulate a concurrent writer that appends before every forward HEAD probe.
+    pub fn append_on_every_head(&self) {
+        self.faults.lock().unwrap().append_on_head = true;
+    }
+
+    pub fn head_probes(&self) -> usize {
+        self.faults.lock().unwrap().head_probes
     }
 }
 
@@ -260,6 +271,22 @@ impl ObjectStore for FaultStore {
     }
 
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
+        let append = {
+            let mut faults = self.faults.lock().unwrap();
+            if options.head {
+                faults.head_probes += 1;
+            }
+            options.head && faults.append_on_head
+        };
+        if append {
+            // The probe names the next free commit, so this is a valid append-only
+            // history with atomic Create and strongly consistent HEAD/GET.
+            self.inner
+                .put_opts(location, competitor_commit(), PutMode::Create.into())
+                .await?;
+            // Model I/O latency and allow the test's deadline to be polled.
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         let vanished = self.faults.lock().unwrap().vanished.clone();
         if vanished.is_some() && location.filename() == vanished.as_deref() {
             return Err(Error::NotFound {
