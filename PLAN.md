@@ -14,6 +14,7 @@ Top priority: this crate must not return a wrong answer.
 - Retries are bounded and backed off; giving up is a typed error.
 
 ### Backend requirements
+0. **The store never fails us on data.** An object, once written, is never lost, deleted or altered by anyone but this crate. We do not defend against storage losing commits; e.g. a deleted commit hidden behind a lagging listing can neither be detected by reads nor stopped from being re-created by a writer, and that is accepted. Request-level failures (errors, timeouts, lost responses) are still expected and handled as described below. Phase 5 cleanup is the one place where *we* delete commits, so it must protect against exactly that case itself.
 1. `PutMode::Create` is atomic: at most one writer creates a given name.
 2. Listing returns a contiguous run of commits. A listing with a *hole* would make a `cas` skip the missing commit when checking its precondition, so the code checks contiguity and errors on a hole.
 3. Reads of a single object (`HEAD`/`GET`) are read-after-write. A listing may lag (miss the newest commits): after listing, the head is extended by probing `n+1, n+2, …` until a number is free. Commits are only created in order, so the probe finds the true head as of that moment — reads and `Conflict` answers are current even with a lagging listing. (An earlier version of this plan claimed lagging listings were safe without the probe; a review showed a lagging listing could produce a `Conflict` naming a historical version.)
