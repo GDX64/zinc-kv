@@ -1,6 +1,8 @@
 //! Shared test support: backends and a fault-injecting `ObjectStore` wrapper.
 #![allow(dead_code)]
 
+pub mod counting;
+
 use std::{
     collections::VecDeque,
     fmt,
