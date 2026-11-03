@@ -10,6 +10,10 @@ impl Version {
     pub(crate) fn from_commit(epoch: u64) -> Self {
         Version(epoch)
     }
+
+    pub(crate) fn number(self) -> u64 {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -2,7 +2,7 @@
 
 Where `zinc-kv` stands against production use. Checked items are done and tested; unchecked items are missing. Design details are in [PLAN.md](PLAN.md).
 
-**Verdict:** not production ready. The two blockers are bounded read cost and validation on the real backend.
+**Verdict:** not production ready. The remaining blocker is validation on the real backend.
 
 ## Correctness: write protocol
 
@@ -35,15 +35,15 @@ Where `zinc-kv` stands against production use. Checked items are done and tested
 
 ## Performance and cost
 
-- [ ] **Blocker:** bounded read cost. Today every operation lists the whole log, and a missing key (as in a lock attempt) reads every commit (Phase 4: checkpoints)
-- [ ] In-memory commit cache and `list_with_offset` (Phase 4)
+- [x] Bounded read cost: reads start from the newest checkpoint and fetch at most `CHECKPOINT_INTERVAL` commits (Phase 4)
+- [x] In-memory commit cache and `list_with_offset` (Phase 4)
 - [ ] Measured request count and latency per operation on S3
 - [ ] Estimate of request cost under polling load
 - [ ] Documented throughput limit (all writes share one commit sequence)
 
 ## Storage
 
-- [ ] Checkpoints (Phase 4)
+- [x] Checkpoints (Phase 4)
 - [ ] Cleanup of old commits (Phase 5)
 - [ ] Phantom-success protection during cleanup: `HEAD` of the next checkpoint after each `Create` (designed in PLAN.md, not built)
 

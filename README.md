@@ -4,7 +4,7 @@ A small, strongly consistent key-value store built on the [`object_store`](https
 
 The store is an embedded Rust library. Every node opens a `Db` on the same bucket and prefix; reads and writes go straight to the object store.
 
-> **Status:** early development. The commit log, transactions and failure handling are done and heavily tested. Read cost still grows with history until checkpoints land (see [Roadmap](#roadmap)). Tested on `InMemory` and `LocalFileSystem` only; not yet against real S3.
+> **Status:** early development. The commit log, transactions, checkpoints and failure handling are done and heavily tested. Old commits are never deleted yet, so storage grows with history (see [Roadmap](#roadmap)). Tested on `InMemory` and `LocalFileSystem` only; not yet against real S3.
 
 ## Usage
 
@@ -80,17 +80,21 @@ Reliability comes first: the store returns a typed error rather than ever guessi
 
 ## How it works
 
-The database is a log of immutable, numbered commit files, in the style of Delta Lake:
+The database is a log of immutable, numbered commit files, in the style of Delta Lake, plus periodic checkpoints of the full state:
 
 ```
 <prefix>/log/00000000000000000001.json
 <prefix>/log/00000000000000000002.json
 ...
+<prefix>/checkpoints/00000000000000000100.json
+<prefix>/checkpoints/00000000000000000200.json
 ```
 
 - **Writing.** A writer finds the newest commit `n`, checks that no commit after its transaction's snapshot writes a key it read, and creates file `n + 1` with `PutMode::Create` (create-if-absent). Only one writer can create a given file, so exactly one wins each number; losers check only the newer commits and retry with backoff. Losing a number to a write of an unrelated key is not a conflict.
 - **Versions.** A commit's number is the version of every key it writes.
-- **Reading.** Scan commits from newest to oldest until the key appears. A delete is recorded as a tombstone.
+- **Reading.** Start from the newest checkpoint and scan the commits after it, newest first, until the key appears; otherwise the checkpoint answers. A delete is recorded as a tombstone.
+- **Checkpoints.** Every `CHECKPOINT_INTERVAL` (100) commits, the writer that reaches the interval writes `checkpoints/<n>.json`: the full live state as of commit `n`. It is a pure function of the log, so concurrent writers of one produce the same file. A missed checkpoint is written by the next writer past it, in order. `Db::checkpoint()` does the same on demand.
+- **Caching.** Commits and checkpoints never change, so each `Db` caches what it has read and lists only the commits after the newest one it knows. A read costs one listing, one `HEAD` probe and the commits since the last checkpoint, at most 100.
 - **Failed writes.** Each write carries a random id. If the store reports a failure (even `AlreadyExists`), the writer later checks whether the commit at that number is its own, so a write that actually landed is never reported as failed or applied twice.
 
 The full design, its reasoning, and the review findings that shaped it are in [PLAN.md](PLAN.md).
@@ -131,7 +135,6 @@ The suite has been checked by mutation: disabling any safety mechanism makes at 
 
 ## Roadmap
 
-- **Phase 4:** commit cache and checkpoints, so reads no longer cost time proportional to history.
 - **Phase 5:** cleanup of old commits after checkpointing.
 - **Phase 6:** `list(prefix)` and consistent snapshots.
 

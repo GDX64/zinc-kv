@@ -14,6 +14,16 @@ pub enum Error {
     },
     #[error("commit {number} has unsupported format version {version}")]
     UnsupportedFormat { number: u64, version: u64 },
+    /// A checkpoint that exists (listed or probed) could not be read.
+    #[error("checkpoint {number} is missing")]
+    MissingCheckpoint { number: u64 },
+    #[error("checkpoint {number} is corrupt: {source}")]
+    CorruptCheckpoint {
+        number: u64,
+        source: serde_json::Error,
+    },
+    #[error("checkpoint {number} has unsupported format version {version}")]
+    UnsupportedCheckpointFormat { number: u64, version: u64 },
     /// Concurrent writers kept winning: repeated lost races, or a log growing faster than
     /// the current head could be confirmed.
     #[error("gave up under contention from concurrent writers")]

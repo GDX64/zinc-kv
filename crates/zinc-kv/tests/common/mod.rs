@@ -10,11 +10,14 @@ use std::{
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::stream::BoxStream;
+use futures::{
+    future::ready,
+    stream::{self, BoxStream, StreamExt, TryStreamExt},
+};
 use object_store::{
     local::LocalFileSystem, memory::InMemory, path::Path, CopyOptions, Error, GetOptions,
-    GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode,
-    PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
+    GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions,
+    PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use tokio::sync::oneshot;
 use zinc_kv::{Db, Version};
@@ -86,7 +89,11 @@ pub async fn update(
         Some(value) => tx.put(key, value),
         None => tx.delete(key),
     }
-    let epoch = tx.commit().await?.epoch.expect("the transaction wrote a key");
+    let epoch = tx
+        .commit()
+        .await?
+        .epoch
+        .expect("the transaction wrote a key");
     Ok((read, epoch))
 }
 
@@ -124,9 +131,13 @@ struct Faults {
     creates: usize,
     append_on_head: bool,
     head_probes: usize,
+    commit_gets: usize,
+    fail_checkpoint_creates: bool,
+    checkpoint_already_exists: bool,
 }
 
-/// Wraps a store and injects faults into `PutMode::Create` and listing.
+/// Wraps a store and injects faults into `PutMode::Create` and listing. `Create` faults
+/// and probe counts apply to commits (`log/`) only; checkpoints have their own fault.
 pub struct FaultStore {
     inner: Arc<dyn ObjectStore>,
     faults: Mutex<Faults>,
@@ -197,6 +208,35 @@ impl FaultStore {
     pub fn head_probes(&self) -> usize {
         self.faults.lock().unwrap().head_probes
     }
+
+    /// Number of commit `GET`s (not `HEAD`s) so far.
+    pub fn commit_gets(&self) -> usize {
+        self.faults.lock().unwrap().commit_gets
+    }
+
+    /// Every checkpoint `Create` fails without writing.
+    pub fn fail_checkpoint_creates(&self, fail: bool) {
+        self.faults.lock().unwrap().fail_checkpoint_creates = fail;
+    }
+
+    /// Every checkpoint `Create` writes, then reports `AlreadyExists`, as when another node
+    /// wrote the same checkpoint first.
+    pub fn checkpoint_already_exists(&self, enabled: bool) {
+        self.faults.lock().unwrap().checkpoint_already_exists = enabled;
+    }
+}
+
+fn is_commit(location: &Path) -> bool {
+    location.as_ref().starts_with(&format!("{PREFIX}/log/"))
+}
+
+/// Whether a listing capped at `head` hides `location`.
+fn beyond_cap(location: &Path, head: Option<u64>) -> bool {
+    let number = location
+        .filename()
+        .and_then(|name| name.strip_suffix(".json"))
+        .and_then(|stem| stem.parse::<u64>().ok());
+    matches!((head, number), (Some(head), Some(number)) if number > head)
 }
 
 fn injected() -> Error {
@@ -208,7 +248,9 @@ fn injected() -> Error {
 
 /// A valid commit written by someone else.
 fn competitor_commit() -> PutPayload {
-    PutPayload::from_static(br#"{"v":1,"id":"competitor","ops":[{"op":"put","key":"competitor","value":""}]}"#)
+    PutPayload::from_static(
+        br#"{"v":1,"id":"competitor","ops":[{"op":"put","key":"competitor","value":""}]}"#,
+    )
 }
 
 impl fmt::Debug for FaultStore {
@@ -233,6 +275,27 @@ impl ObjectStore for FaultStore {
     ) -> Result<PutResult> {
         if !matches!(opts.mode, PutMode::Create) {
             return self.inner.put_opts(location, payload, opts).await;
+        }
+        if !is_commit(location) {
+            let (fail, exists) = {
+                let faults = self.faults.lock().unwrap();
+                (
+                    faults.fail_checkpoint_creates,
+                    faults.checkpoint_already_exists,
+                )
+            };
+            if fail {
+                return Err(injected());
+            }
+            let result = self.inner.put_opts(location, payload, opts).await;
+            if exists {
+                result?;
+                return Err(Error::AlreadyExists {
+                    path: location.to_string(),
+                    source: "injected fault".into(),
+                });
+            }
+            return result;
         }
 
         let (pause, fault, steal) = {
@@ -290,10 +353,14 @@ impl ObjectStore for FaultStore {
     async fn get_opts(&self, location: &Path, options: GetOptions) -> Result<GetResult> {
         let append = {
             let mut faults = self.faults.lock().unwrap();
-            if options.head {
+            let commit = is_commit(location);
+            if commit && options.head {
                 faults.head_probes += 1;
             }
-            options.head && faults.append_on_head
+            if commit && !options.head {
+                faults.commit_gets += 1;
+            }
+            commit && options.head && faults.append_on_head
         };
         if append {
             // The probe names the next free commit, so this is a valid append-only
@@ -325,6 +392,36 @@ impl ObjectStore for FaultStore {
         self.inner.list(prefix)
     }
 
+    fn list_with_offset(
+        &self,
+        prefix: Option<&Path>,
+        offset: &Path,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        let (fail, in_flight, head) = {
+            let mut faults = self.faults.lock().unwrap();
+            let fail = faults.fail_list;
+            let in_flight = if fail { None } else { faults.in_flight.take() };
+            (fail, in_flight, faults.listing_head)
+        };
+        if fail {
+            return stream::once(ready(Err(injected()))).boxed();
+        }
+        let inner = self.inner.clone();
+        let (prefix, offset) = (prefix.cloned(), offset.clone());
+        stream::once(async move {
+            if let Some((location, payload)) = in_flight {
+                // Lands only if the name is still free, like any `Create`.
+                let _ = inner
+                    .put_opts(&location, payload, PutMode::Create.into())
+                    .await;
+            }
+            inner.list_with_offset(prefix.as_ref(), &offset)
+        })
+        .flatten()
+        .try_filter(move |object| ready(!beyond_cap(&object.location, head)))
+        .boxed()
+    }
+
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         let (fail, in_flight) = {
             let mut faults = self.faults.lock().unwrap();
@@ -344,16 +441,9 @@ impl ObjectStore for FaultStore {
         }
         let mut listing = self.inner.list_with_delimiter(prefix).await?;
         let head = self.faults.lock().unwrap().listing_head;
-        if let Some(head) = head {
-            listing.objects.retain(|object| {
-                object
-                    .location
-                    .filename()
-                    .and_then(|name| name.strip_suffix(".json"))
-                    .and_then(|stem| stem.parse::<u64>().ok())
-                    .is_none_or(|number| number <= head)
-            });
-        }
+        listing
+            .objects
+            .retain(|object| !beyond_cap(&object.location, head));
         Ok(listing)
     }
 

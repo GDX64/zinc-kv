@@ -64,7 +64,7 @@ impl Op {
     }
 }
 
-mod b64 {
+pub(crate) mod b64 {
     use super::*;
     use std::result::Result;
 

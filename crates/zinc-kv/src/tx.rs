@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use bytes::Bytes;
 
-use crate::{commit::Op, CommitResult, Db, Entry, Error, Result};
+use crate::{commit::Op, CommitResult, Db, Entry, Error, Result, Snapshot};
 
 /// A transaction: reads at one snapshot, writes buffered until [`Tx::commit`].
 ///
@@ -11,8 +11,8 @@ use crate::{commit::Op, CommitResult, Db, Entry, Error, Result};
 /// transaction is tried once; retrying is up to the caller. Dropping it discards it.
 pub struct Tx<'a> {
     db: &'a Db,
-    /// Head fixed by the first read.
-    snapshot: Option<u64>,
+    /// Fixed by the first read.
+    snapshot: Option<Snapshot>,
     reads: HashSet<String>,
     writes: Vec<Op>,
 }
@@ -37,9 +37,9 @@ impl<'a> Tx<'a> {
                 key: key.to_owned(),
             });
         }
-        let snapshot = match self.snapshot {
+        let snapshot = match &self.snapshot {
             Some(snapshot) => snapshot,
-            None => *self.snapshot.insert(self.db.head().await?),
+            None => self.snapshot.insert(self.db.head().await?),
         };
         let entry = self.db.get_at(snapshot, key).await?;
         // Only a read that succeeded is a dependency.
@@ -66,7 +66,7 @@ impl<'a> Tx<'a> {
         if self.writes.is_empty() {
             return Ok(CommitResult { epoch: None });
         }
-        let snapshot = self.snapshot.unwrap_or(0);
+        let snapshot = self.snapshot.map_or(0, |s| s.head);
         let version = self.db.commit(self.writes, &self.reads, snapshot).await?;
         Ok(CommitResult {
             epoch: Some(version),

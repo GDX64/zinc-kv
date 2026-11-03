@@ -76,11 +76,23 @@ Tests (each on both backends unless noted):
   17. Mixed workload: concurrent writers on different keys plus deletes; every key ends at its last written value; versions per key strictly increase.
 - **Model** (`tests/model.rs`): seeded random sequence of get/put/delete/cas (right and wrong expected versions) through several `Db`s on one store, checked against a `HashMap` model.
 
-## Phase 4 — Read cost: cache and checkpoints
+## Phase 4 — Read cost: cache and checkpoints (done)
 Until now every operation lists the whole log, and a `get` of a missing key (as in any lock attempt) fetches *every* commit. This must be bounded before anything else is built on top.
 - In-memory cache of commit files by number (safe since immutable); `list_with_offset` lists only commits newer than what is cached.
 - `checkpoint()`: N is always an exact multiple of a fixed `CHECKPOINT_INTERVAL` (e.g. 100), and checkpoint N is only written once checkpoint N − interval exists, so checkpoints exist in order with no gaps (Phase 5 relies on this). Read the previous checkpoint, replay commits up to N, write `checkpoints/<N>.json` (full live state, each key with its original version, no tombstones) with `PutMode::Create`. It is a pure function of the immutable log, so any node may write it and duplicate writers produce identical bytes; it never conflicts with commits.
 - Read: load newest checkpoint, replay commits after N; contiguity is then checked from N+1.
+
+As built:
+- `CHECKPOINT_INTERVAL = 100`, public: it is part of the storage format.
+- Checkpoint format `{"v":1,"entries":[{"key","value","version"}]}`, sorted by key, `deny_unknown_fields`. Decoding rejects an unknown `v` (`UnsupportedCheckpointFormat`), unparseable files, unsorted or repeated keys and versions newer than the checkpoint (`CorruptCheckpoint`). A checkpoint that was listed or probed but cannot be read is `MissingCheckpoint`.
+- Writing: after a successful commit K, if K ≥ base + interval the writer calls `checkpoint()`, best effort (the commit has landed regardless). `checkpoint()` replays from the newest known checkpoint and creates each missing multiple in order; `AlreadyExists` means another node wrote the same bytes. So a missed checkpoint is caught up by the next commit past it.
+- Locating: on first use a `Db` lists `checkpoints/` and probes forward with `HEAD` (the listing may lag; checkpoints exist without gaps). Afterwards, whenever the log head has reached base + interval, it probes for the next checkpoint and moves to it.
+- Cache per `Db`: the newest checkpoint, the highest confirmed commit, decoded commits after the base. A head lookup lists `log/` with `list_with_offset` from the highest confirmed commit (or the base) and checks that the listing continues it without a hole, then probes forward as before. Only direct children of `log/` count.
+- A transaction holds its snapshot's checkpoint, so its reads stay at the snapshot after the `Db` moves on; evicted commits are fetched again.
+- A blind write whose head is the checkpoint decodes the checkpoint instead of the head commit (which cleanup may have deleted).
+- Known cost: while a checkpoint is due but not written, each head lookup sends one extra `HEAD`.
+
+Tests (`tests/checkpoints.rs`, both backends): reads from a fresh `Db` fetch only the commits after the newest checkpoint (counted by the fault store), cached on the second read; reads and writes work with all commits before the checkpoint removed; failing checkpoint writes are caught up in order by the next commit; `checkpoint()` is idempotent and byte-identical across nodes; losing the race to write a checkpoint is accepted; a lagging checkpoint listing is probed past; a long-lived reader follows new checkpoints; a transaction keeps its snapshot across a new checkpoint and still conflicts on a changed read; damaged checkpoints (not JSON, unknown field, future version, unsorted, newer format) are errors for reads and writes. The fault store now applies listing faults to `list_with_offset` and keeps `Create` faults on commits. Mutation-checked: ignoring checkpoint entries, no probe after the listing or past the checkpoint listing, listing from 1 despite a checkpoint, no commit cache, no contiguity check, no version check, keeping deleted keys, treating `AlreadyExists` as failure.
 
 ## Phase 5 — Cleanup
 - `cleanup(retention)`: delete commits ≤ N and older checkpoints only after a long retention period.
@@ -91,7 +103,7 @@ Until now every operation lists the whole log, and a `get` of a missing key (as 
 - `list(prefix)` merging newest-wins; `snapshot()` pinning a head number for consistent multi-reads.
 
 ## Phase 7 — Multi-key transactions (done)
-Atomic writes to several keys, and consistent reads across them, without the caller handling versions. A transaction fails only if a key it read changed; it is tried once, and retrying is up to the caller. Built before Phase 4, so `tx.get` still scans the log. `cas` was removed: a transaction that reads a key and writes it is the same check, and one conditional-write path is easier to keep correct.
+Atomic writes to several keys, and consistent reads across them, without the caller handling versions. A transaction fails only if a key it read changed; it is tried once, and retrying is up to the caller. `cas` was removed: a transaction that reads a key and writes it is the same check, and one conditional-write path is easier to keep correct.
 
 API:
 - `db.begin() -> Tx`: no I/O.
@@ -109,7 +121,7 @@ Protocol:
 - Sound for the same reasons `cas` was: the contiguity check and forward probe mean no commit after S is skipped, and settling before the check means our own commit is never taken for a conflict. Transactions are serializable: each commit is checked against every commit between its snapshot and its own number.
 
 Interactions:
-- Phase 4: the check reads only commits after S, cached once fetched. Build after Phase 4, since uncached `tx.get` scans the whole log and keeps transactions open longer.
+- Phase 4: the check reads only commits after S, cached once fetched; reads start from the snapshot's checkpoint.
 - Phase 5: a transaction open longer than the retention may find commits after S deleted. It cannot be checked, so `commit` returns a typed error, never success. The phantom-success `HEAD` check after `Create` applies to transaction commits too.
 - Phase 6: `snapshot()` becomes `begin()`. `list(prefix)` inside a transaction adds the prefix to the read set, so a key created under it later is a conflict.
 
