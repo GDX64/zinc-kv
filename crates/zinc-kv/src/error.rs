@@ -18,6 +18,11 @@ pub enum Error {
     UnsupportedFormat { number: u64, version: u64 },
     #[error("gave up after repeated write conflicts")]
     Contention,
+    /// The write may or may not have been applied: an attempt failed in a way that could
+    /// still have written its commit (now or later), and that could not be settled.
+    /// Read the key to find out.
+    #[error("write outcome unknown: {source}")]
+    OutcomeUnknown { source: Box<Error> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -136,6 +136,39 @@ async fn retry_window_other_key_succeeds() {
     }
 }
 
+/// The listing lags behind completed commits (hides everything after commit 1). Reads must
+/// still see the latest value, and a `cas` against the true current version must succeed
+/// rather than report a `Conflict` with a historical version.
+#[tokio::test]
+async fn stale_listing_still_reads_and_writes_current_state() {
+    for backend in BACKENDS {
+        let inner = store(backend, "stale_listing");
+        let writer = open(&inner).await;
+        writer.put("lock", text("first")).await.unwrap();
+        let second = writer.put("lock", text("second")).await.unwrap();
+
+        let faulty = FaultStore::new(inner.clone());
+        faulty.cap_listing_at(1);
+        let reader = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+
+        let entry = reader.get("lock").await.unwrap().unwrap();
+        assert_eq!((entry.value, entry.version), (text("second"), second), "{backend:?}");
+
+        let err = reader.cas("lock", None, Some(text("x"))).await.unwrap_err();
+        assert!(
+            matches!(err, CasError::Conflict { current: Some(v) } if v == second),
+            "{backend:?}: {err:?}"
+        );
+        let third = reader
+            .cas("lock", Some(second), Some(text("third")))
+            .await
+            .unwrap();
+        assert!(third > second);
+        assert_eq!(writer.get("lock").await.unwrap().unwrap().version, third);
+        assert_eq!(log_files(&inner).await.len(), 3, "{backend:?}");
+    }
+}
+
 /// An unconditional put that loses the race for its number retries and lands after B.
 #[tokio::test]
 async fn put_retries_after_lost_race() {

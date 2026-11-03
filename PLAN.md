@@ -15,13 +15,13 @@ Top priority: this crate must not return a wrong answer.
 
 ### Backend requirements
 1. `PutMode::Create` is atomic: at most one writer creates a given name.
-2. Listing returns a contiguous run of commits. A stale listing (missing the newest commits) is safe for writes — the `Create` of an existing number fails. A listing with a *hole* is not: a `cas` would skip the missing commit when checking its precondition. So the code checks contiguity and errors on a hole.
-3. Linearizable `get` additionally needs read-after-write listing (true for `InMemory`, `LocalFileSystem`, and AWS S3).
+2. Listing returns a contiguous run of commits. A listing with a *hole* would make a `cas` skip the missing commit when checking its precondition, so the code checks contiguity and errors on a hole.
+3. Reads of a single object (`HEAD`/`GET`) are read-after-write. A listing may lag (miss the newest commits): after listing, the head is extended by probing `n+1, n+2, …` until a number is free. Commits are only created in order, so the probe finds the true head as of that moment — reads and `Conflict` answers are current even with a lagging listing. (An earlier version of this plan claimed lagging listings were safe without the probe; a review showed a lagging listing could produce a `Conflict` naming a historical version.)
 
 ---
 
 ## Workspace layout
-Cargo workspace (`Cargo.toml` at root, shared `[workspace.dependencies]`), crates under `crates/`. `crates/zinc-kv` is the KV store; `crates/zinc-fs` is a test-only `ObjectStore` adding `PutMode::Update` to the local filesystem (no longer used by `zinc-kv`). File paths below are relative to `crates/zinc-kv/`.
+Cargo workspace (`Cargo.toml` at root, shared `[workspace.dependencies]`), crates under `crates/`. `crates/zinc-kv` is the KV store. (`crates/zinc-fs`, a test-only `ObjectStore` adding `PutMode::Update` to the local filesystem, is unused and being removed; a review also found its conditional updates race with unconditional writes.) File paths below are relative to `crates/zinc-kv/`.
 
 ## Phase 1 — Minimum: one object, CAS-safe (done, superseded by Phase 2)
 Whole DB in one `state.json`, read-modify-write with `PutMode::Update`. Established the public API:
@@ -43,12 +43,12 @@ Code:
 - **Strict names**: only `<20 digits>.json` counts as a commit; other objects in `log/` are ignored.
 - **Commit format** `{"v":1,"id":"<random 128-bit hex>","ops":[...]}`. Unknown `v` → `Error::UnsupportedFormat`; unparseable file → `Error::Corrupt`. `deny_unknown_fields`.
 - **Ambiguous writes**: `id` is unique per `commit()` call and reused across its retries. Any failed `Create` (including `AlreadyExists`) may hide a write of ours — a lost response, a client retry of a request that had landed, a request still in flight. The number is kept as *uncertain* and retried like a lost race; on each pass, every uncertain number the listing now shows as taken is read, and if it carries our `id` the write succeeded. This runs before the precondition check, so a writer never reports `Conflict` against its own commit. A request can only land at the number it named, so no landed write of ours is missed or duplicated.
-- **Errors are retried**: `LocalFileSystem` on Windows reports a plain error (staging-file `Access is denied`) instead of `AlreadyExists` when two writers race for the same number — found by running the concurrency tests on disk. So `Create` errors are retried like lost races; when attempts run out, the last store error is returned (or `Contention` if the last failures were lost races). Listing and read errors are returned immediately.
+- **Errors are retried**: `LocalFileSystem` on Windows reports a plain error (staging-file `Access is denied`) instead of `AlreadyExists` when two writers race for the same number — found by running the concurrency tests on disk. So `Create` errors are retried like lost races. When attempts run out, uncertain numbers are settled one last time (a review found the final attempt's failure was never checked). Then: if a failed number is still free, the request might yet land → `Error::OutcomeUnknown` wrapping the cause; otherwise the last store error, or `Contention` if the last failures were lost races. Any error raised while a number is still uncertain (e.g. a failed listing) also becomes `OutcomeUnknown`.
 - **Backoff**: full-jitter exponential backoff between attempts (1 ms doubling, capped at 32 ms), bounded by `MAX_ATTEMPTS`.
 
 Test support: `tests/common/mod.rs` with a fault-injecting `ObjectStore` wrapper (pause before a commit `Create`; make the next or every `Create` fail before writing, after writing, report `AlreadyExists` after writing, or land only at the next listing; let a competitor steal every number; fail listing; make a listed file unreadable), plus helpers to run a test on both `InMemory` and `LocalFileSystem`.
 
-The suite was checked by mutation: disabling the contiguity check, the precondition recheck, the uncertain-number check, or error retries each makes at least one test fail.
+The suite was checked by mutation: disabling the contiguity check, the precondition recheck, the uncertain-number check, error retries, the final settle, the forward probe, `deny_unknown_fields` on ops, or the `OutcomeUnknown` mapping each makes at least one test fail.
 
 Tests (each on both backends unless noted):
 - **Commit path** (`tests/commit_path.rs`)
@@ -68,6 +68,7 @@ Tests (each on both backends unless noted):
   13. `Create` fails, then the request lands before the next listing → claimed as ours: no duplicate, no `Conflict`.
   14. Listing fails → error returned.
   15. Every number is stolen by a competitor → `Contention` after a bounded time.
+  - Review findings, now regular tests: the final attempt's `Create` lands but reports a failure (error, `AlreadyExists`, delayed) → recognised as success, retry limit measured not assumed; unknown fields inside an op → `Corrupt`; a lagging listing → reads and `cas` see the current state, no false `Conflict` (`commit_path.rs`); `Create` failing at numbers taken by others → plain store error, not `OutcomeUnknown`.
 - **Concurrency** (`tests/concurrency.rs`, both backends)
   16. Counter and lock tests.
   17. Mixed workload: concurrent writers on different keys plus deletes; every key ends at its last written value; versions per key strictly increase.

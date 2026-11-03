@@ -217,29 +217,114 @@ async fn transient_write_failure_is_retried() {
     }
 }
 
-/// A store that keeps failing: the store error is returned and nothing is written.
+/// A store that keeps failing. The failed request might still land (the number is free),
+/// so the outcome is reported as unknown, carrying the store error.
 #[tokio::test]
-async fn persistent_write_failure_returns_error() {
+async fn persistent_write_failure_is_outcome_unknown() {
     for backend in BACKENDS {
         let inner = store(backend, "persistent_write");
         let faulty = FaultStore::new(inner.clone());
         let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
 
         faulty.fail_every_create(Some(CreateFault::FailBeforeWrite));
-        assert!(matches!(
-            db.put("k", text("a")).await,
-            Err(Error::Store(_))
-        ));
-        assert!(matches!(
-            db.cas("k", None, Some(text("a"))).await,
-            Err(CasError::Other(Error::Store(_)))
-        ));
+        let result = db.put("k", text("a")).await;
+        assert!(
+            matches!(&result, Err(Error::OutcomeUnknown { source }) if matches!(**source, Error::Store(_))),
+            "{result:?}"
+        );
+        let result = db.cas("k", None, Some(text("a"))).await;
+        assert!(
+            matches!(&result, Err(CasError::Other(Error::OutcomeUnknown { .. }))),
+            "{result:?}"
+        );
         assert!(log_files(&inner).await.is_empty(), "{backend:?}");
         assert_eq!(db.get("k").await.unwrap(), None);
 
         faulty.fail_every_create(None);
         db.put("k", text("b")).await.unwrap();
         assert_eq!(db.get("k").await.unwrap().unwrap().value, text("b"));
+    }
+}
+
+/// Every `Create` fails, but each number is taken by a competitor: none of our requests
+/// can land, so this is a plain store error, not an unknown outcome.
+#[tokio::test]
+async fn failure_at_taken_numbers_is_a_plain_error() {
+    for backend in BACKENDS {
+        let inner = store(backend, "failure_taken");
+        let faulty = FaultStore::new(inner.clone());
+        let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+
+        faulty.steal_every_create();
+        faulty.fail_every_create(Some(CreateFault::FailBeforeWrite));
+        let result = db.put("k", text("a")).await;
+        assert!(matches!(result, Err(Error::Store(_))), "{backend:?}: {result:?}");
+        assert_eq!(db.get("k").await.unwrap(), None);
+    }
+}
+
+/// The final attempt's `Create` lands but reports a failure. There is no next pass to
+/// settle it, so the writer must still recognise it before giving up. The retry limit is
+/// measured rather than assumed.
+#[tokio::test]
+async fn landed_write_on_final_attempt_is_recognised() {
+    let limit = {
+        let faulty = FaultStore::new(store(common::Backend::Memory, "measure_limit"));
+        faulty.fail_every_create(Some(CreateFault::FailBeforeWrite));
+        let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+        db.put("k", text("a")).await.unwrap_err();
+        faulty.creates()
+    };
+    assert!(limit > 1);
+
+    for backend in BACKENDS {
+        for (label, last) in [
+            ("error", CreateFault::FailAfterWrite),
+            ("already_exists", CreateFault::AlreadyExistsAfterWrite),
+            ("delayed", CreateFault::FailThenLandLater),
+        ] {
+            let inner = store(backend, &format!("final_attempt_{label}"));
+            let faulty = FaultStore::new(inner.clone());
+            let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+            faulty.fail_create_sequence(
+                std::iter::repeat_n(CreateFault::FailBeforeWrite, limit - 1)
+                    .chain(std::iter::once(last)),
+            );
+
+            let result = db.cas("lock", None, Some(text("me"))).await;
+            assert_eq!(faulty.creates(), limit, "{backend:?}/{label}");
+            let entry = open(&inner).await.get("lock").await.unwrap().unwrap();
+            assert_eq!(entry.value, text("me"));
+            assert!(
+                matches!(result, Ok(v) if v == entry.version),
+                "{backend:?}/{label}: {result:?}"
+            );
+            assert_eq!(log_files(&inner).await.len(), 1, "{backend:?}/{label}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unknown_operation_fields_are_corrupt() {
+    for backend in BACKENDS {
+        for (label, op) in [
+            ("put", r#"{"op":"put","key":"k","value":"bWU=","expires":0}"#),
+            ("delete", r#"{"op":"delete","key":"k","value":"bWU="}"#),
+        ] {
+            let inner = store(backend, &format!("op_field_{label}"));
+            inner
+                .put(
+                    &Path::from(format!("{PREFIX}/log/{}", commit_name(1))),
+                    text(&format!(r#"{{"v":1,"id":"x","ops":[{op}]}}"#)).into(),
+                )
+                .await
+                .unwrap();
+            let result = open(&inner).await.get("k").await;
+            assert!(
+                matches!(result, Err(Error::Corrupt { number: 1, .. })),
+                "{backend:?}/{label}: {result:?}"
+            );
+        }
     }
 }
 

@@ -88,10 +88,9 @@ impl Db {
     /// A failed `Create`, even one reporting `AlreadyExists`, may still have written the
     /// commit (a lost response, a client retry), or may write it later (a request still in
     /// flight). So every failed number is kept as *uncertain* and retried like a lost race;
-    /// once a later listing shows it taken, its `id` says whether the write was ours. A request can only ever land at the
-    /// number it named, so this finds every write of ours that landed. If the attempts
-    /// run out, the last store error is returned and the outcome is unknown only if a
-    /// request may still land later (never on `InMemory` or `LocalFileSystem`).
+    /// once the head reaches it, its `id` says whether the write was ours. A request can
+    /// only ever land at the number it named, so this finds every write of ours that
+    /// landed. Any error while a number is still uncertain becomes `OutcomeUnknown`.
     async fn commit(
         &self,
         key: &str,
@@ -112,26 +111,42 @@ impl Db {
             serde_json::to_vec(&Commit::new(id.clone(), vec![op])).map_err(Error::from)?,
         );
 
+        // Numbers whose `Create` failed and that were still free at the last head.
+        let mut uncertain = Vec::new();
+        match self
+            .attempt_commits(key, expected, &id, payload, &mut uncertain)
+            .await
+        {
+            Err(CasError::Other(e)) if !uncertain.is_empty() => Err(Error::OutcomeUnknown {
+                source: Box::new(e),
+            }
+            .into()),
+            result => result,
+        }
+    }
+
+    async fn attempt_commits(
+        &self,
+        key: &str,
+        expected: Option<Option<Version>>,
+        id: &str,
+        payload: Bytes,
+        uncertain: &mut Vec<u64>,
+    ) -> std::result::Result<Version, CasError> {
         // Commits up to `checked` are already reflected in `current`.
         let mut checked = 0;
         let mut current = None;
-        // Numbers whose `Create` failed and that were still free at the last listing.
-        let mut uncertain: Vec<u64> = Vec::new();
         let mut last_error: Option<StoreError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
                 backoff(attempt).await;
             }
             let head = self.head().await?;
-
-            // A taken number is final: ours or another writer's. Checked before the
-            // precondition, so that our own commit is never mistaken for a conflicting one.
-            for &number in uncertain.iter().filter(|&&n| n <= head) {
-                if self.is_ours(number, &id).await? {
-                    return Ok(Version::from_commit(number));
-                }
+            // Checked before the precondition, so that our own commit is never mistaken
+            // for a conflicting one.
+            if let Some(number) = self.settle(uncertain, head, id).await? {
+                return Ok(Version::from_commit(number));
             }
-            uncertain.retain(|&n| n > head);
 
             if let Some(expected) = expected {
                 if let Some(found) = self.find(checked + 1..=head, key).await? {
@@ -161,7 +176,24 @@ impl Db {
                 }
             }
         }
+        // The last attempt's failure has not been settled yet.
+        let head = self.head().await?;
+        if let Some(number) = self.settle(uncertain, head, id).await? {
+            return Ok(Version::from_commit(number));
+        }
         Err(last_error.map_or(Error::Contention, Error::from).into())
+    }
+
+    /// Settles the uncertain numbers that `head` has reached: a taken number is final,
+    /// either ours or another writer's. Returns ours if found; leaves the rest uncertain.
+    async fn settle(&self, uncertain: &mut Vec<u64>, head: u64, id: &str) -> Result<Option<u64>> {
+        for &number in uncertain.iter().filter(|&&n| n <= head) {
+            if self.is_ours(number, id).await? {
+                return Ok(Some(number));
+            }
+        }
+        uncertain.retain(|&n| n > head);
+        Ok(None)
     }
 
     /// Newest entry for `key` among the commits `numbers`.
@@ -185,8 +217,13 @@ impl Db {
         Ok(None)
     }
 
-    /// Number of the newest commit (0 for an empty log), after checking that the log is
-    /// exactly `1..=head`.
+    /// Number of the newest commit (0 for an empty log), after checking that the listed
+    /// commits are exactly `1..=n`.
+    ///
+    /// A listing may lag behind completed commits. Commits are only created in order (a
+    /// writer creates `n + 1` after seeing `n`), so probing `n + 1, n + 2, …` until a free
+    /// number finds the true head as of that probe, which is what makes reads and
+    /// `Conflict` answers current.
     async fn head(&self) -> Result<u64> {
         let dir = self.prefix.clone().join("log");
         let listing = self.store.list_with_delimiter(Some(&dir)).await?;
@@ -201,7 +238,19 @@ impl Db {
                 return Err(Error::MissingCommit { number: expected });
             }
         }
-        Ok(numbers.len() as u64)
+        let mut head = numbers.len() as u64;
+        while self.exists(head + 1).await? {
+            head += 1;
+        }
+        Ok(head)
+    }
+
+    async fn exists(&self, number: u64) -> Result<bool> {
+        match self.store.head(&self.commit_path(number)).await {
+            Ok(_) => Ok(true),
+            Err(StoreError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// `None` if the commit does not exist.

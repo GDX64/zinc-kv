@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use std::{
+    collections::VecDeque,
     fmt,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -97,10 +98,13 @@ struct Faults {
     pause: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
     next_create: Option<CreateFault>,
     every_create: Option<CreateFault>,
+    create_sequence: VecDeque<CreateFault>,
     in_flight: Option<(Path, PutPayload)>,
     steal_every_create: bool,
     fail_list: bool,
     vanished: Option<String>,
+    listing_head: Option<u64>,
+    creates: usize,
 }
 
 /// Wraps a store and injects faults into `PutMode::Create` and listing.
@@ -136,6 +140,16 @@ impl FaultStore {
         self.faults.lock().unwrap().every_create = fault;
     }
 
+    /// Apply one fault per Create, in order, then resume normal behavior.
+    pub fn fail_create_sequence(&self, faults: impl IntoIterator<Item = CreateFault>) {
+        self.faults.lock().unwrap().create_sequence = faults.into_iter().collect();
+    }
+
+    /// Return a contiguous but stale listing, hiding commits newer than `head`.
+    pub fn cap_listing_at(&self, head: u64) {
+        self.faults.lock().unwrap().listing_head = Some(head);
+    }
+
     /// Before every `Create`, a competitor creates the same path first.
     pub fn steal_every_create(&self) {
         self.faults.lock().unwrap().steal_every_create = true;
@@ -149,6 +163,11 @@ impl FaultStore {
     /// as if it was deleted between the listing and the read.
     pub fn vanish_on_get(&self, name: &str) {
         self.faults.lock().unwrap().vanished = Some(name.to_owned());
+    }
+
+    /// Number of `Create` calls received so far.
+    pub fn creates(&self) -> usize {
+        self.faults.lock().unwrap().creates
     }
 }
 
@@ -190,9 +209,14 @@ impl ObjectStore for FaultStore {
 
         let (pause, fault, steal) = {
             let mut faults = self.faults.lock().unwrap();
+            faults.creates += 1;
             (
                 faults.pause.take(),
-                faults.next_create.take().or(faults.every_create),
+                faults
+                    .create_sequence
+                    .pop_front()
+                    .or_else(|| faults.next_create.take())
+                    .or(faults.every_create),
                 faults.steal_every_create,
             )
         };
@@ -272,7 +296,19 @@ impl ObjectStore for FaultStore {
                 .put_opts(&location, payload, PutMode::Create.into())
                 .await;
         }
-        self.inner.list_with_delimiter(prefix).await
+        let mut listing = self.inner.list_with_delimiter(prefix).await?;
+        let head = self.faults.lock().unwrap().listing_head;
+        if let Some(head) = head {
+            listing.objects.retain(|object| {
+                object
+                    .location
+                    .filename()
+                    .and_then(|name| name.strip_suffix(".json"))
+                    .and_then(|stem| stem.parse::<u64>().ok())
+                    .is_none_or(|number| number <= head)
+            });
+        }
+        Ok(listing)
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
