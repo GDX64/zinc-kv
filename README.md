@@ -58,8 +58,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 | `get(key)` | `Option<Entry>` | Current value and its `Version`, or `None`. |
 | `put(key, value)` | `Version` | Unconditional write. |
 | `delete(key)` | `()` | Unconditional delete. |
+| `list(prefix)` | `Vec<(String, Entry)>` | Every live key starting with `prefix`, sorted. `""` lists everything. |
 | `begin()` | `Tx` | Starts a transaction. No I/O until its first read. |
 | `tx.get(key)` | `Option<Entry>` | Reads at the transaction's snapshot, fixed by its first read. Records the key, found or absent, as a dependency. |
+| `tx.list(prefix)` | `Vec<(String, Entry)>` | Lists at the snapshot. Any later write under the prefix, including a new key, is a dependency. |
 | `tx.put(key, value)`, `tx.delete(key)` | | Buffered until commit; no I/O. |
 | `tx.commit()` | `CommitResult` | Writes every buffered op in one commit, or fails with `Error::Conflict` if a key the transaction read was written after its snapshot. Writes to other keys do not conflict. Tried once: retrying is up to the caller. `epoch` is the new version of every key written (`None` if nothing was written). |
 
@@ -72,7 +74,7 @@ Reliability comes first: the store returns a typed error rather than ever guessi
 | Error | When |
 | --- | --- |
 | `Error::Conflict { key }` | A key the transaction read changed after its snapshot. Nothing was written. |
-| `Error::ReadAfterWrite { key }` | The transaction read a key it had already written. |
+| `Error::ReadAfterWrite { key }` | The transaction read a key (or listed a prefix covering a key) it had already written. |
 | `Error::Contention` | Other writers kept winning, or the log grew faster than the head could be confirmed. Retry later. |
 | `Error::OutcomeUnknown` | A write failed in a way that may still have applied it. A later read is **not** conclusive; if you need certainty, put a unique token in the value. |
 | `Error::Expired { number }` | The operation stalled for longer than the cleanup retention: its snapshot's commits are gone, or its write re-created a cleaned-up commit no reader will see. Nothing visible was written. |
@@ -138,6 +140,5 @@ The suite has been checked by mutation: disabling any safety mechanism makes at 
 
 ## Roadmap
 
-- **Phase 6:** `list(prefix)` and consistent snapshots.
 
 Details and later ideas (leases, watch) are in [PLAN.md](PLAN.md).

@@ -12,6 +12,26 @@ use zinc_kv::{Error, Version};
 
 const KEYS: [&str; 5] = ["a", "b", "c", "lock", "config/x"];
 const NODES: usize = 3;
+const PREFIXES: [&str; 5] = ["", "c", "config/", "l", "z"];
+
+type Model = HashMap<&'static str, (Bytes, Version)>;
+
+fn listed(model: &Model, prefix: &str) -> Vec<(String, Bytes, Version)> {
+    let mut entries: Vec<_> = model
+        .iter()
+        .filter(|(k, _)| k.starts_with(prefix))
+        .map(|(k, (value, version))| (k.to_string(), value.clone(), *version))
+        .collect();
+    entries.sort();
+    entries
+}
+
+fn flatten(entries: Vec<(String, zinc_kv::Entry)>) -> Vec<(String, Bytes, Version)> {
+    entries
+        .into_iter()
+        .map(|(k, e)| (k, e.value, e.version))
+        .collect()
+}
 
 async fn run(backend: Backend, seed: u64, steps: usize) {
     let store = store(backend, &format!("model-{seed}"));
@@ -20,7 +40,7 @@ async fn run(backend: Backend, seed: u64, steps: usize) {
         nodes.push(open(&store).await);
     }
     let mut rng = StdRng::seed_from_u64(seed);
-    let mut model: HashMap<&str, (Bytes, Version)> = HashMap::new();
+    let mut model = Model::new();
     // Every version handed out must exceed the one before.
     let mut last: Option<Version> = None;
     let mut record = |v: Version, ctx: &str| {
@@ -37,6 +57,11 @@ async fn run(backend: Backend, seed: u64, steps: usize) {
         let value = Bytes::from(format!("{seed}-{step}"));
 
         match rng.random_range(0..5) {
+            0 if rng.random_bool(0.5) => {
+                let prefix = PREFIXES[rng.random_range(0..PREFIXES.len())];
+                let got = flatten(db.list(prefix).await.unwrap());
+                assert_eq!(got, listed(&model, prefix), "{ctx}: list {prefix:?}");
+            }
             0 => {
                 let got = db.get(key).await.unwrap().map(|e| (e.value, e.version));
                 assert_eq!(got, model.get(key).cloned(), "{ctx}: get {key}");
@@ -51,9 +76,10 @@ async fn run(backend: Backend, seed: u64, steps: usize) {
                 model.remove(key);
             }
             op => {
-                // A transaction reading `key` and maybe one more key, then writing `key`
-                // (half of them delete). In op 4 another node writes a random key between
-                // the reads and the commit: a conflict exactly when it was read.
+                // A transaction reading `key`, maybe one more key and maybe a prefix, then
+                // writing `key` (half of them delete). In op 4 another node writes a random
+                // key between the reads and the commit: a conflict exactly when it was read
+                // or lies under the listed prefix.
                 let mut tx = db.begin();
                 let mut reads = vec![key];
                 if rng.random_bool(0.5) {
@@ -62,6 +88,13 @@ async fn run(backend: Backend, seed: u64, steps: usize) {
                 for &k in &reads {
                     let got = tx.get(k).await.unwrap().map(|e| (e.value, e.version));
                     assert_eq!(got, model.get(k).cloned(), "{ctx}: tx get {k}");
+                }
+                let prefix = rng
+                    .random_bool(0.3)
+                    .then(|| PREFIXES[rng.random_range(0..PREFIXES.len())]);
+                if let Some(prefix) = prefix {
+                    let got = flatten(tx.list(prefix).await.unwrap());
+                    assert_eq!(got, listed(&model, prefix), "{ctx}: tx list {prefix:?}");
                 }
                 let interfering = if op == 4 {
                     let other = KEYS[rng.random_range(0..KEYS.len())];
@@ -82,10 +115,11 @@ async fn run(backend: Backend, seed: u64, steps: usize) {
                     None => tx.delete(key),
                 }
                 let result = tx.commit().await;
-                match interfering.filter(|k| reads.contains(k)) {
+                let depends = |k: &&str| reads.contains(k) || prefix.is_some_and(|p| k.starts_with(p));
+                match interfering.filter(depends) {
                     Some(changed) => match result {
                         Err(Error::Conflict { key: k }) => assert_eq!(k, changed, "{ctx}"),
-                        other => panic!("{ctx}: reads {reads:?}, {changed} changed, got {other:?}"),
+                        other => panic!("{ctx}: reads {reads:?} {prefix:?}, {changed} changed, got {other:?}"),
                     },
                     None => {
                         let v = result

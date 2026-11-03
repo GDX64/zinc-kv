@@ -20,8 +20,8 @@ mod tx;
 mod types;
 
 use std::{
-    collections::{BTreeMap, HashSet},
-    ops::RangeInclusive,
+    collections::BTreeMap,
+    ops::{Bound, RangeInclusive},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -37,6 +37,7 @@ pub use types::{CommitResult, Entry, Version};
 
 use checkpoint::Checkpoint;
 use commit::{Commit, Op};
+use tx::ReadSet;
 
 /// Commits between checkpoints. Part of the storage format: every node must agree on it.
 pub const CHECKPOINT_INTERVAL: u64 = 100;
@@ -101,7 +102,7 @@ impl Db {
             key: key.to_owned(),
             value,
         };
-        self.commit(vec![op], &HashSet::new(), 0).await
+        self.commit(vec![op], &ReadSet::default(), 0).await
     }
 
     /// Unconditional delete. Deleting a missing key still records a tombstone.
@@ -109,8 +110,15 @@ impl Db {
         let op = Op::Delete {
             key: key.to_owned(),
         };
-        self.commit(vec![op], &HashSet::new(), 0).await?;
+        self.commit(vec![op], &ReadSet::default(), 0).await?;
         Ok(())
+    }
+
+    /// Every live key starting with `prefix`, sorted, with its entry. An empty prefix lists
+    /// everything.
+    pub async fn list(&self, prefix: &str) -> Result<Vec<(String, Entry)>> {
+        let snapshot = self.head().await?;
+        self.list_at(&snapshot, prefix).await
     }
 
     /// Starts a transaction. No I/O until its first read.
@@ -210,6 +218,43 @@ impl Db {
         }
     }
 
+    /// The keys under `prefix` as of `snapshot`: commits after the checkpoint, newest
+    /// first, decide each key they mention; the checkpoint answers for the rest.
+    async fn list_at(&self, snapshot: &Snapshot, prefix: &str) -> Result<Vec<(String, Entry)>> {
+        let base = &snapshot.base;
+        // `None` for a key whose newest write is a delete.
+        let mut decided: BTreeMap<String, Option<Entry>> = BTreeMap::new();
+        for number in (base.number + 1..=snapshot.head).rev() {
+            let commit = self.commit_at(number).await?;
+            // The last op on a key within a commit wins.
+            for op in commit.ops.iter().rev() {
+                if op.key().starts_with(prefix) && !decided.contains_key(op.key()) {
+                    let entry = match op {
+                        Op::Put { value, .. } => Some(Entry {
+                            value: value.clone(),
+                            version: Version::from_commit(number),
+                        }),
+                        Op::Delete { .. } => None,
+                    };
+                    decided.insert(op.key().to_owned(), entry);
+                }
+            }
+        }
+        let older = base
+            .entries
+            .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+            .take_while(|(key, _)| key.starts_with(prefix));
+        for (key, entry) in older {
+            decided
+                .entry(key.clone())
+                .or_insert_with(|| Some(entry.clone()));
+        }
+        Ok(decided
+            .into_iter()
+            .filter_map(|(key, entry)| Some((key, entry?)))
+            .collect())
+    }
+
     /// `key` as of `snapshot`.
     async fn get_at(&self, snapshot: &Snapshot, key: &str) -> Result<Option<Entry>> {
         let base = &snapshot.base;
@@ -231,7 +276,7 @@ impl Db {
     /// once the head reaches it, its `id` says whether the write was ours. A request can
     /// only ever land at the number it named, so this finds every write of ours that
     /// landed. Any error while a number is still uncertain becomes `OutcomeUnknown`.
-    async fn commit(&self, ops: Vec<Op>, reads: &HashSet<String>, snapshot: u64) -> Result<Version> {
+    async fn commit(&self, ops: Vec<Op>, reads: &ReadSet, snapshot: u64) -> Result<Version> {
         let id = format!("{:032x}", rand::random::<u128>());
         let payload = Bytes::from(serde_json::to_vec(&Commit::new(id.clone(), ops))?);
 
@@ -274,7 +319,7 @@ impl Db {
 
     async fn attempt_commits(
         &self,
-        reads: &HashSet<String>,
+        reads: &ReadSet,
         snapshot: u64,
         id: &str,
         payload: Bytes,
@@ -395,15 +440,15 @@ impl Db {
         Ok(None)
     }
 
-    /// A key from `keys` that one of the commits `numbers` writes, if any.
+    /// A key in `reads` that one of the commits `numbers` writes, if any.
     async fn touched(
         &self,
         numbers: RangeInclusive<u64>,
-        keys: &HashSet<String>,
+        reads: &ReadSet,
     ) -> Result<Option<String>> {
         for number in numbers.rev() {
             let commit = self.commit_at(number).await?;
-            if let Some(op) = commit.ops.iter().find(|op| keys.contains(op.key())) {
+            if let Some(op) = commit.ops.iter().find(|op| reads.contains(op.key())) {
                 return Ok(Some(op.key().to_owned()));
             }
         }

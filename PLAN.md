@@ -108,8 +108,16 @@ As built (the mitigation above changed; see the first bullet):
 
 Tests (`tests/cleanup.rs`, both backends): deletes exactly up to the newest old checkpoint, keeps it, later commits and stray files, and reads, writes and later checkpoints carry on; the first commit after cleanup (predecessor deleted) is visible; retention keeps recent checkpoints; concurrent cleanups; an idle `Db` catches up; a transaction older than the cleanup gets `Expired` on read and commit; a writer stalled across cleanup gets `Expired` for its re-created commit (commit 1 and a later one), readers are unaffected, and the orphan goes with the next cleanup. Mutation-checked: no visibility check, timestamps ignored, missing commits never `Expired`, no hole recovery, retention ignored, deleting the kept checkpoint or one commit too many, cleanup without refreshing the head.
 
-## Phase 6 — `list(prefix)` and snapshots
+## Phase 6 — `list(prefix)` and snapshots (done)
 - `list(prefix)` merging newest-wins; `snapshot()` pinning a head number for consistent multi-reads.
+
+As built:
+- No separate `snapshot()`: `begin()` is the snapshot (Phase 7), and a read-only transaction is dropped without committing.
+- `Db::list(prefix)` and `Tx::list(prefix)` return `Vec<(String, Entry)>`, sorted by key, live keys only. The commits after the checkpoint, newest first and last op first within a commit, decide every key they mention under the prefix; the checkpoint answers for the rest (a `BTreeMap` range).
+- In a transaction the prefix joins the read set (keys and prefixes): any later op on a key starting with it, including a new key or a delete, is `Conflict { key }`. Listing a prefix covering a key the transaction already wrote is `ReadAfterWrite`.
+- Cost: one pass over the commits since the checkpoint, at most `CHECKPOINT_INTERVAL`, plus the checkpoint's matching range.
+
+Tests (`tests/list.rs`): merge of checkpoint and later commits (update, delete, new key, prefix boundary, versions, empty prefix); last op within a commit; prefix conflicts on create, update and delete, none for a key just outside the prefix; list after write; list at the snapshot. The model test lists random prefixes, through `Db` and inside transactions, where a write under a listed prefix must conflict. Mutation-checked: prefix not a dependency or not recorded, list after write allowed, oldest commit or first op wins, deletes ignored, checkpoint ignored, keys past the prefix listed.
 
 ## Phase 7 — Multi-key transactions (done)
 Atomic writes to several keys, and consistent reads across them, without the caller handling versions. A transaction fails only if a key it read changed; it is tried once, and retrying is up to the caller. `cas` was removed: a transaction that reads a key and writes it is the same check, and one conditional-write path is easier to keep correct.
@@ -132,7 +140,7 @@ Protocol:
 Interactions:
 - Phase 4: the check reads only commits after S, cached once fetched; reads start from the snapshot's checkpoint.
 - Phase 5: a transaction open longer than the retention may find commits after S deleted. It cannot be checked, so `commit` returns `Expired`, never success. The visibility check after `Create` applies to transaction commits too.
-- Phase 6: `snapshot()` becomes `begin()`. `list(prefix)` inside a transaction adds the prefix to the read set, so a key created under it later is a conflict.
+- Phase 6: `snapshot()` became `begin()`. `list(prefix)` inside a transaction adds the prefix to the read set, so a key created under it later is a conflict.
 
 Tests (both backends):
 - Happy path; consistent multi-key reads.

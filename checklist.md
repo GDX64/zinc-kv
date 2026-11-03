@@ -59,7 +59,7 @@ Where `zinc-kv` stands against production use. Checked items are done and tested
 
 - [x] `get`, `put`, `delete` and transactions with opaque, ordered `Version`
 - [ ] Lease or TTL support: a crashed lock holder holds the lock forever (pattern noted in PLAN.md only)
-- [ ] `list(prefix)` and snapshots (Phase 6)
+- [x] `list(prefix)` and snapshots (Phase 6); a listed prefix is a transaction dependency
 - [ ] Watch for changes (planned: poll for the next commit with `HEAD`)
 - [x] Multi-key transactions, failing only when a key they read changed (Phase 7); `cas` removed
 
