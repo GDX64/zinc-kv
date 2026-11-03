@@ -1,10 +1,15 @@
 //! A small strongly consistent key-value store on top of `object_store`.
 //!
-//! Phase 1: the whole database is a single object, rewritten on every commit
-//! with a conditional put.
+//! Layout under the prefix:
+//! - `manifest.json`: the only mutable object, replaced with a conditional put.
+//! - `segments/<id>.json`: immutable batches of writes, one per commit.
+//!
+//! A commit uploads a segment, then wins by appending it to the manifest.
 
 mod error;
-mod state;
+mod manifest;
+mod segment;
+mod types;
 
 use std::sync::Arc;
 
@@ -14,37 +19,49 @@ use object_store::{
 };
 
 pub use error::{CasError, Error, Result};
-pub use state::{Entry, Version};
+pub use types::{Entry, Version};
 
-use state::{State, Stored};
+use manifest::{Manifest, SegmentRef};
+use segment::{Op, Segment};
 
 const MAX_ATTEMPTS: usize = 64;
 
 pub struct Db {
     store: Arc<dyn ObjectStore>,
-    path: Path,
+    prefix: Path,
 }
 
-/// State as read from the store, plus the tag needed to conditionally overwrite it.
+/// Manifest as read from the store, plus the tag needed to conditionally replace it.
 struct Snapshot {
-    state: State,
-    /// `None` if the object does not exist yet.
+    manifest: Manifest,
+    /// `None` if the manifest does not exist yet.
     tag: Option<UpdateVersion>,
+}
+
+/// What the newest segment mentioning a key says about it.
+struct Found {
+    version: Version,
+    /// `None` for a tombstone.
+    value: Option<Bytes>,
+}
+
+impl Found {
+    fn live_version(&self) -> Option<Version> {
+        self.value.as_ref().map(|_| self.version)
+    }
 }
 
 impl Db {
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<Db> {
-        Ok(Db {
-            store,
-            path: prefix.join("state.json"),
-        })
+        Ok(Db { store, prefix })
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<Entry>> {
         let snap = self.load().await?;
-        Ok(snap.state.entries.get(key).map(|s| Entry {
-            value: s.value.clone(),
-            version: s.version,
+        let found = self.find(&snap.manifest.segments, key).await?;
+        Ok(found.and_then(|f| {
+            let version = f.version;
+            f.value.map(|value| Entry { value, version })
         }))
     }
 
@@ -72,49 +89,110 @@ impl Db {
         self.commit(key, Some(expected), new).await
     }
 
-    /// Read-modify-write loop. `expected: None` skips the precondition check.
+    /// `expected: None` skips the precondition check.
     async fn commit(
         &self,
         key: &str,
         expected: Option<Option<Version>>,
         new: Option<Bytes>,
     ) -> std::result::Result<Version, CasError> {
-        for _ in 0..MAX_ATTEMPTS {
-            let Snapshot { mut state, tag } = self.load().await?;
+        let mut snap = self.load().await?;
 
-            let current = state.entries.get(key).map(|s| s.version);
+        // Version of the key as of `snap`; only tracked when there is a precondition.
+        let mut current = None;
+        if let Some(expected) = expected {
+            current = self
+                .find(&snap.manifest.segments, key)
+                .await?
+                .and_then(|f| f.live_version());
+            if expected != current {
+                return Err(CasError::Conflict { current });
+            }
+        }
+
+        let segment_path = self.upload_segment(key, new).await?;
+
+        for _ in 0..MAX_ATTEMPTS {
+            let commit_epoch = snap.manifest.epoch + 1;
+            let mut next = snap.manifest.clone();
+            next.epoch = commit_epoch;
+            next.segments.push(SegmentRef {
+                path: segment_path.to_string(),
+                commit_epoch,
+            });
+
+            if self.store_manifest(&next, snap.tag.clone()).await? {
+                return Ok(Version::from_epoch(commit_epoch));
+            }
+
+            // Lost the race: reload, and re-check the precondition against only the
+            // segments that were added since our snapshot.
+            let seen = snap.manifest.segments.len();
+            snap = self.load().await?;
             if let Some(expected) = expected {
+                if let Some(found) = self.find(&snap.manifest.segments[seen..], key).await? {
+                    current = found.live_version();
+                }
                 if expected != current {
                     return Err(CasError::Conflict { current });
                 }
-            }
-
-            state.epoch += 1;
-            let version = Version::from_epoch(state.epoch);
-            match &new {
-                Some(value) => {
-                    state.entries.insert(
-                        key.to_owned(),
-                        Stored {
-                            value: value.clone(),
-                            version,
-                        },
-                    );
-                }
-                None => {
-                    state.entries.remove(key);
-                }
-            }
-
-            if self.store_if_unchanged(&state, tag).await? {
-                return Ok(version);
             }
         }
         Err(Error::Contention.into())
     }
 
+    /// Newest segment entry for `key` among `segments` (ordered oldest to newest).
+    async fn find(&self, segments: &[SegmentRef], key: &str) -> Result<Option<Found>> {
+        for seg_ref in segments.iter().rev() {
+            let bytes = self
+                .store
+                .get(&Path::from(seg_ref.path.as_str()))
+                .await?
+                .bytes()
+                .await?;
+            let segment: Segment = serde_json::from_slice(&bytes)?;
+            // A segment may mention a key more than once; the last op wins.
+            if let Some(op) = segment.ops.into_iter().rev().find(|op| op.key() == key) {
+                return Ok(Some(Found {
+                    version: Version::from_epoch(seg_ref.commit_epoch),
+                    value: match op {
+                        Op::Put { value, .. } => Some(value),
+                        Op::Delete { .. } => None,
+                    },
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    async fn upload_segment(&self, key: &str, new: Option<Bytes>) -> Result<Path> {
+        let op = match new {
+            Some(value) => Op::Put {
+                key: key.to_owned(),
+                value,
+            },
+            None => Op::Delete {
+                key: key.to_owned(),
+            },
+        };
+        let path = self
+            .prefix
+            .clone()
+            .join("segments")
+            .join(format!("{}.json", uuid::Uuid::now_v7()));
+        let payload = Bytes::from(serde_json::to_vec(&Segment { ops: vec![op] })?);
+        self.store
+            .put_opts(&path, payload.into(), PutMode::Create.into())
+            .await?;
+        Ok(path)
+    }
+
+    fn manifest_path(&self) -> Path {
+        self.prefix.clone().join("manifest.json")
+    }
+
     async fn load(&self) -> Result<Snapshot> {
-        match self.store.get(&self.path).await {
+        match self.store.get(&self.manifest_path()).await {
             Ok(res) => {
                 let tag = UpdateVersion {
                     e_tag: res.meta.e_tag.clone(),
@@ -122,28 +200,32 @@ impl Db {
                 };
                 let bytes = res.bytes().await?;
                 Ok(Snapshot {
-                    state: serde_json::from_slice(&bytes)?,
+                    manifest: serde_json::from_slice(&bytes)?,
                     tag: Some(tag),
                 })
             }
             Err(StoreError::NotFound { .. }) => Ok(Snapshot {
-                state: State::default(),
+                manifest: Manifest::default(),
                 tag: None,
             }),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Returns `false` if someone else wrote since we loaded.
-    async fn store_if_unchanged(&self, state: &State, tag: Option<UpdateVersion>) -> Result<bool> {
+    /// Returns `false` if someone else replaced the manifest since we loaded it.
+    async fn store_manifest(
+        &self,
+        manifest: &Manifest,
+        tag: Option<UpdateVersion>,
+    ) -> Result<bool> {
         let mode = match tag {
             None => PutMode::Create,
             Some(v) => PutMode::Update(v),
         };
-        let payload = Bytes::from(serde_json::to_vec(state)?);
+        let payload = Bytes::from(serde_json::to_vec(manifest)?);
         match self
             .store
-            .put_opts(&self.path, payload.into(), mode.into())
+            .put_opts(&self.manifest_path(), payload.into(), mode.into())
             .await
         {
             Ok(_) => Ok(true),
