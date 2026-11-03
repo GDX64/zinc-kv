@@ -350,6 +350,74 @@ async fn write_landing_after_error_is_claimed() {
     }
 }
 
+/// An unknown outcome remains unknown even if a subsequent read sees no value: the
+/// failed Create may still be in flight and land after that read.
+#[tokio::test]
+async fn unknown_write_can_land_after_an_absent_read() {
+    for backend in BACKENDS {
+        let inner = store(backend, "unknown_lands_after_read");
+        let faulty = FaultStore::new(inner.clone());
+        let writer = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+        let reader = open(&inner).await;
+
+        faulty.fail_next_create(CreateFault::FailThenLandLater);
+        let paused = faulty.pause_next_create();
+        let task = tokio::spawn(async move { writer.cas("lock", None, Some(text("me"))).await });
+        paused.reached.await.unwrap();
+        // Fail the writer's next listing, leaving the delayed Create unresolved.
+        faulty.fail_list(true);
+        paused.resume.send(()).unwrap();
+        let result = task.await.unwrap();
+        assert!(
+            matches!(result, Err(CasError::Other(Error::OutcomeUnknown { .. }))),
+            "{backend:?}: {result:?}"
+        );
+
+        assert_eq!(reader.get("lock").await.unwrap(), None, "{backend:?}");
+        // A later listing releases the pending request, which can still create the lock.
+        faulty.fail_list(false);
+        let delayed = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+        assert_eq!(
+            delayed.get("lock").await.unwrap().unwrap().value,
+            text("me"),
+            "{backend:?}"
+        );
+        assert_eq!(log_files(&inner).await.len(), 1, "{backend:?}");
+    }
+}
+
+/// A read of the current value also cannot establish whether an earlier unknown write
+/// landed: another writer may already have replaced it.
+#[tokio::test]
+async fn unknown_write_can_be_overwritten_before_a_read() {
+    for backend in BACKENDS {
+        let inner = store(backend, "unknown_overwritten");
+        let faulty = FaultStore::new(inner.clone());
+        let writer = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
+        let reader = open(&inner).await;
+
+        faulty.fail_next_create(CreateFault::FailAfterWrite);
+        let paused = faulty.pause_next_create();
+        let task = tokio::spawn(async move { writer.put("k", text("first")).await });
+        paused.reached.await.unwrap();
+        faulty.fail_list(true);
+        paused.resume.send(()).unwrap();
+        let result = task.await.unwrap();
+        assert!(
+            matches!(result, Err(Error::OutcomeUnknown { .. })),
+            "{backend:?}: {result:?}"
+        );
+
+        reader.put("k", text("second")).await.unwrap();
+        assert_eq!(
+            reader.get("k").await.unwrap().unwrap().value,
+            text("second"),
+            "{backend:?}"
+        );
+        assert_eq!(log_files(&inner).await.len(), 2, "{backend:?}");
+    }
+}
+
 #[tokio::test]
 async fn failed_listing_returns_error() {
     for backend in BACKENDS {

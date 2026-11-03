@@ -22,7 +22,12 @@ pub enum Error {
     Contention,
     /// The write may or may not have been applied: an attempt failed in a way that could
     /// still have written its commit (now or later), and that could not be settled.
-    /// Read the key to find out.
+    ///
+    /// Reading the key afterwards is **not** conclusive: the request may still land after
+    /// the read, and a landed write may already have been overwritten by another writer.
+    /// Callers that need certainty should make their writes identifiable, e.g. put a
+    /// unique token in the value: seeing the token proves the write landed; not seeing it
+    /// proves nothing.
     #[error("write outcome unknown: {source}")]
     OutcomeUnknown { source: Box<Error> },
 }

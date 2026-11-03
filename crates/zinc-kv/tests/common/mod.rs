@@ -311,7 +311,9 @@ impl ObjectStore for FaultStore {
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         let (fail, in_flight) = {
             let mut faults = self.faults.lock().unwrap();
-            (faults.fail_list, faults.in_flight.take())
+            let fail = faults.fail_list;
+            let in_flight = if fail { None } else { faults.in_flight.take() };
+            (fail, in_flight)
         };
         if fail {
             return Err(injected());
