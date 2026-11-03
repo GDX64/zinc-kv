@@ -2,9 +2,9 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use bytes::Bytes;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-/// An immutable batch of writes. Carries no epoch: the manifest's `SegmentRef` does.
+/// The contents of one commit file. Carries no number: the file name does.
 #[derive(Serialize, Deserialize)]
-pub(crate) struct Segment {
+pub(crate) struct Commit {
     pub ops: Vec<Op>,
 }
 
@@ -16,6 +16,7 @@ pub(crate) enum Op {
         #[serde(with = "b64")]
         value: Bytes,
     },
+    /// A tombstone: hides any older entry for the key.
     Delete {
         key: String,
     },

@@ -1,8 +1,8 @@
 use std::{path::PathBuf, sync::Arc};
 
 use bytes::Bytes;
-use object_store::path::Path;
-use zinc_fs::CasLocalFileSystem;
+use object_store::{local::LocalFileSystem, path::Path};
+
 use zinc_kv::Db;
 
 /// Same flow as the in-memory happy path, but on the local filesystem under
@@ -13,7 +13,7 @@ async fn put_get_cas_delete_on_disk() {
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
 
-    let store = Arc::new(CasLocalFileSystem::new_with_prefix(&root).unwrap());
+    let store = Arc::new(LocalFileSystem::new_with_prefix(&root).unwrap());
     let db = Db::open(store, Path::from("mesh")).await.unwrap();
 
     assert!(db.get("leader").await.unwrap().is_none());

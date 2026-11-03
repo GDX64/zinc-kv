@@ -16,4 +16,3 @@ thiserror = "2"
 rand = "0.9"
 tokio = "1"
 tempfile = "3"
-uuid = { version = "1", features = ["v7"] }
