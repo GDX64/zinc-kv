@@ -129,10 +129,7 @@ impl Db {
         while state.number + CHECKPOINT_INTERVAL <= snapshot.head {
             let number = state.number + CHECKPOINT_INTERVAL;
             for n in state.number + 1..=number {
-                let commit = self
-                    .read_commit(n)
-                    .await?
-                    .ok_or(Error::MissingCommit { number: n })?;
+                let commit = self.commit_at(n).await?;
                 state.apply(n, &commit.ops);
             }
             let payload = state.encode()?;
@@ -152,6 +149,65 @@ impl Db {
             self.advance_base(Arc::new(state.clone()));
         }
         Ok(())
+    }
+
+    /// Deletes what no reader needs any more: every commit up to the newest checkpoint
+    /// older than `retention`, then the checkpoints before it.
+    ///
+    /// `retention` must exceed the longest any operation may stall, plus the clock skew
+    /// between this node and the store's timestamps. An operation that stalls longer fails
+    /// with [`Error::Expired`] rather than succeed invisibly. Safe to run from several
+    /// nodes at once.
+    pub async fn cleanup(&self, retention: Duration) -> Result<()> {
+        // Moves this `Db` to the newest checkpoint before anything is deleted.
+        self.head().await?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let cutoff = now.saturating_sub(retention).as_millis() as i64;
+
+        let dir = self.prefix.clone().join("checkpoints");
+        let mut checkpoints: Vec<(u64, Path)> = self
+            .store
+            .list_with_delimiter(Some(&dir))
+            .await?
+            .objects
+            .into_iter()
+            .filter(|o| o.last_modified.timestamp_millis() <= cutoff)
+            .filter_map(|o| {
+                let n = parse_commit_name(o.location.filename()?)?;
+                (n % CHECKPOINT_INTERVAL == 0).then_some((n, o.location))
+            })
+            .collect();
+        checkpoints.sort_unstable_by_key(|(n, _)| *n);
+        let Some(&(keep, _)) = checkpoints.last() else {
+            return Ok(());
+        };
+
+        // Ascending and one at a time: `visible` relies on commit `n - 1` being gone
+        // before commit `n` is.
+        let mut commits = self.list_commits_after(0).await?;
+        commits.retain(|&n| n <= keep);
+        for n in commits {
+            self.delete_if_present(&self.commit_path(n)).await?;
+        }
+        for (n, location) in checkpoints {
+            if n < keep {
+                self.delete_if_present(&location).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_if_present(&self, path: &Path) -> Result<()> {
+        match self.store.delete(path).await {
+            // Another node's cleanup got there first.
+            Ok(()) | Err(StoreError::NotFound { .. }) => Ok(()),
+            // Windows' `LocalFileSystem` reports a plain error when two deletes race; the
+            // file being gone is what counts.
+            Err(e) if self.exists(path).await? => Err(e.into()),
+            Err(_) => Ok(()),
+        }
     }
 
     /// `key` as of `snapshot`.
@@ -190,6 +246,23 @@ impl Db {
             }),
             result => result,
         }?;
+        // A writer stalled for longer than the cleanup retention may have re-created a
+        // commit that cleanup deleted: its `Create` succeeds, but readers start from a
+        // checkpoint past it and never see it.
+        match self.visible(version.number()).await {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(Error::Expired {
+                    number: version.number(),
+                })
+            }
+            // The commit landed, but whether readers see it is unknown.
+            Err(e) => {
+                return Err(Error::OutcomeUnknown {
+                    source: Box::new(e),
+                })
+            }
+        }
         let base = self.cache.lock().unwrap().base.number;
         if version.number() >= base + CHECKPOINT_INTERVAL {
             // Best effort: the commit has landed either way, and the next commit past the
@@ -234,9 +307,7 @@ impl Db {
                 // newer format whose rules this writer does not know. Every writer checks
                 // this, so once a newer format is at the head, older writers stop. (A head
                 // that is the checkpoint was decoded as the checkpoint.)
-                self.read_commit(head)
-                    .await?
-                    .ok_or(Error::MissingCommit { number: head })?;
+                self.commit_at(head).await?;
             }
             checked = head;
 
@@ -266,6 +337,34 @@ impl Db {
         Err(last_error.map_or(Error::Contention, Error::from))
     }
 
+    /// Whether commit `number`, which we just wrote, is one readers will see, rather than
+    /// a re-creation of a commit that cleanup deleted.
+    ///
+    /// Cleanup deletes commits in ascending order, so while `number - 1` exists, `number`
+    /// was never deleted: ours is the only commit ever written there. One `HEAD`.
+    ///
+    /// Otherwise (`number - 1` is gone too, or this is commit 1), compare timestamps: a
+    /// checkpoint at or past `number` older than our commit can only exist if an earlier
+    /// commit `number` did, so ours re-created it. A checkpoint written after ours was
+    /// built from ours. The listing may lag, but only behind recent checkpoints, and those
+    /// are newer than our commit anyway.
+    async fn visible(&self, number: u64) -> Result<bool> {
+        if number > 1 && self.exists(&self.commit_path(number - 1)).await? {
+            return Ok(true);
+        }
+        let ours = self.store.head(&self.commit_path(number)).await?.last_modified;
+        let dir = self.prefix.clone().join("checkpoints");
+        let listing = self.store.list_with_delimiter(Some(&dir)).await?;
+        let covered_before = listing.objects.iter().any(|o| {
+            o.location
+                .filename()
+                .and_then(parse_commit_name)
+                .is_some_and(|n| n >= number && n % CHECKPOINT_INTERVAL == 0)
+                && o.last_modified < ours
+        });
+        Ok(!covered_before)
+    }
+
     /// Settles the uncertain numbers that `head` has reached: a taken number is final,
     /// either ours or another writer's. Returns ours if found; leaves the rest uncertain.
     async fn settle(&self, uncertain: &mut Vec<u64>, head: u64, id: &str) -> Result<Option<u64>> {
@@ -281,10 +380,7 @@ impl Db {
     /// Newest entry for `key` among the commits `numbers`.
     async fn find(&self, numbers: RangeInclusive<u64>, key: &str) -> Result<Option<Found>> {
         for number in numbers.rev() {
-            let commit = self
-                .read_commit(number)
-                .await?
-                .ok_or(Error::MissingCommit { number })?;
+            let commit = self.commit_at(number).await?;
             // A commit may mention a key more than once; the last op wins.
             if let Some(op) = commit.ops.iter().rev().find(|op| op.key() == key) {
                 return Ok(Some(Found {
@@ -306,10 +402,7 @@ impl Db {
         keys: &HashSet<String>,
     ) -> Result<Option<String>> {
         for number in numbers.rev() {
-            let commit = self
-                .read_commit(number)
-                .await?
-                .ok_or(Error::MissingCommit { number })?;
+            let commit = self.commit_at(number).await?;
             if let Some(op) = commit.ops.iter().find(|op| keys.contains(op.key())) {
                 return Ok(Some(op.key().to_owned()));
             }
@@ -335,27 +428,29 @@ impl Db {
         if !located {
             self.locate_checkpoint().await?;
         }
-        let base = self.cache.lock().unwrap().base.clone();
-        let from = known.max(base.number);
-
-        let dir = self.prefix.clone().join("log");
-        let mut numbers: Vec<u64> = self
-            .store
-            .list_with_offset(Some(&dir), &self.commit_path(from))
-            .try_filter_map(|o| {
-                // Only direct children of `log/`.
-                let child = o.location.prefix_match(&dir).is_some_and(|rest| rest.count() == 1);
-                let number = o.location.filename().and_then(parse_commit_name);
-                futures::future::ready(Ok(number.filter(|_| child)))
-            })
-            .try_collect()
-            .await?;
-        numbers.sort_unstable();
-        for (expected, &n) in (from + 1..).zip(&numbers) {
-            if n != expected {
-                return Err(Error::MissingCommit { number: expected });
+        let mut base = self.cache.lock().unwrap().base.clone();
+        let mut retried = false;
+        let (from, numbers) = loop {
+            let from = known.max(base.number);
+            let numbers = self.list_commits_after(from).await?;
+            let hole = (from + 1..)
+                .zip(&numbers)
+                .find_map(|(expected, &n)| (n != expected).then_some(expected));
+            match hole {
+                None => break (from, numbers),
+                // A `Db` idle for longer than the cleanup retention may find commits it
+                // never listed deleted, covered by a newer checkpoint. Move to it once.
+                Some(expected) if !retried => {
+                    retried = true;
+                    let newer = self.locate_checkpoint().await?;
+                    if newer.number <= from {
+                        return Err(Error::MissingCommit { number: expected });
+                    }
+                    base = newer;
+                }
+                Some(expected) => return Err(Error::MissingCommit { number: expected }),
             }
-        }
+        };
         let listed = from + numbers.len() as u64;
         let mut head = listed;
         while self.exists(&self.commit_path(head + 1)).await? {
@@ -373,25 +468,58 @@ impl Db {
 
         // Checkpoints are written only for commits that exist, so a newer one is possible
         // only once the log has reached it.
+        let base = self.probe_checkpoints(&base, head).await?;
+        Ok(Snapshot { head, base })
+    }
+
+    /// Commit numbers listed after `from`, sorted, gaps included. Only direct children of
+    /// `log/` count.
+    async fn list_commits_after(&self, from: u64) -> Result<Vec<u64>> {
+        let dir = self.prefix.clone().join("log");
+        let mut numbers: Vec<u64> = self
+            .store
+            .list_with_offset(Some(&dir), &self.commit_path(from))
+            .try_filter_map(|o| {
+                let child = o.location.prefix_match(&dir).is_some_and(|rest| rest.count() == 1);
+                let number = o.location.filename().and_then(parse_commit_name);
+                futures::future::ready(Ok(number.filter(|_| child)))
+            })
+            .try_collect()
+            .await?;
+        numbers.sort_unstable();
+        Ok(numbers)
+    }
+
+    /// The newest checkpoint up to commit `limit`, probing forward from `base`; `base`
+    /// itself if there is none newer.
+    async fn probe_checkpoints(
+        &self,
+        base: &Arc<Checkpoint>,
+        limit: u64,
+    ) -> Result<Arc<Checkpoint>> {
         let mut number = base.number;
-        while number + CHECKPOINT_INTERVAL <= head
+        while number.saturating_add(CHECKPOINT_INTERVAL) <= limit
             && self
                 .exists(&self.checkpoint_path(number + CHECKPOINT_INTERVAL))
                 .await?
         {
             number += CHECKPOINT_INTERVAL;
+            if number - base.number >= MAX_PROBES * CHECKPOINT_INTERVAL {
+                return Err(Error::Contention);
+            }
         }
-        let base = if number > base.number {
-            self.load_checkpoint(number).await?
+        if number > base.number {
+            self.load_checkpoint(number).await
         } else {
-            base
-        };
-        Ok(Snapshot { head, base })
+            Ok(base.clone())
+        }
     }
 
-    /// Finds the newest checkpoint on first use: lists `checkpoints/`, then probes past
-    /// the listing (which may lag), since checkpoints exist in order without gaps.
-    async fn locate_checkpoint(&self) -> Result<()> {
+    /// Finds the newest checkpoint, on first use or after falling behind cleanup (which
+    /// deletes old checkpoints, so probing forward from an old one would stop short):
+    /// lists `checkpoints/`, then probes past the listing (which may lag), since the
+    /// checkpoints after the oldest kept one exist without gaps.
+    async fn locate_checkpoint(&self) -> Result<Arc<Checkpoint>> {
         let dir = self.prefix.clone().join("checkpoints");
         let listing = self.store.list_with_delimiter(Some(&dir)).await?;
         let listed = listing
@@ -411,11 +539,14 @@ impl Db {
                 return Err(Error::Contention);
             }
         }
-        if number > 0 {
-            self.load_checkpoint(number).await?;
-        }
+        let known = self.cache.lock().unwrap().base.clone();
+        let base = if number > known.number {
+            self.load_checkpoint(number).await?
+        } else {
+            known
+        };
         self.cache.lock().unwrap().located = true;
-        Ok(())
+        Ok(base)
     }
 
     /// Reads checkpoint `number` and makes it the base if it is the newest known.
@@ -465,12 +596,21 @@ impl Db {
         Ok(Some(commit))
     }
 
-    /// Whether commit `number` exists and was written by the attempt `id`.
+    /// Commit `number`, which must exist. A missing one that a known checkpoint covers was
+    /// cleaned up while we were using it: `Expired`. Otherwise the log is damaged.
+    async fn commit_at(&self, number: u64) -> Result<Arc<Commit>> {
+        match self.read_commit(number).await? {
+            Some(commit) => Ok(commit),
+            None if number <= self.cache.lock().unwrap().base.number => {
+                Err(Error::Expired { number })
+            }
+            None => Err(Error::MissingCommit { number }),
+        }
+    }
+
+    /// Whether commit `number`, which the head has reached, was written by the attempt `id`.
     async fn is_ours(&self, number: u64, id: &str) -> Result<bool> {
-        Ok(self
-            .read_commit(number)
-            .await?
-            .is_some_and(|commit| commit.id == id))
+        Ok(self.commit_at(number).await?.id == id)
     }
 
     fn commit_path(&self, number: u64) -> Path {

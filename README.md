@@ -4,7 +4,7 @@ A small, strongly consistent key-value store built on the [`object_store`](https
 
 The store is an embedded Rust library. Every node opens a `Db` on the same bucket and prefix; reads and writes go straight to the object store.
 
-> **Status:** early development. The commit log, transactions, checkpoints and failure handling are done and heavily tested. Old commits are never deleted yet, so storage grows with history (see [Roadmap](#roadmap)). Tested on `InMemory` and `LocalFileSystem` only; not yet against real S3.
+> **Status:** early development. The commit log, transactions, checkpoints, cleanup and failure handling are done and heavily tested. Tested on `InMemory` and `LocalFileSystem` only; not yet against real S3.
 
 ## Usage
 
@@ -75,7 +75,9 @@ Reliability comes first: the store returns a typed error rather than ever guessi
 | `Error::ReadAfterWrite { key }` | The transaction read a key it had already written. |
 | `Error::Contention` | Other writers kept winning, or the log grew faster than the head could be confirmed. Retry later. |
 | `Error::OutcomeUnknown` | A write failed in a way that may still have applied it. A later read is **not** conclusive; if you need certainty, put a unique token in the value. |
+| `Error::Expired { number }` | The operation stalled for longer than the cleanup retention: its snapshot's commits are gone, or its write re-created a cleaned-up commit no reader will see. Nothing visible was written. |
 | `Error::MissingCommit`, `Corrupt`, `UnsupportedFormat` | The log is damaged or written in a newer format. Never read around. |
+| `Error::MissingCheckpoint`, `CorruptCheckpoint`, `UnsupportedCheckpointFormat` | The same, for a checkpoint. |
 | `Error::Store` | The object store returned an error. |
 
 ## How it works
@@ -95,6 +97,7 @@ The database is a log of immutable, numbered commit files, in the style of Delta
 - **Reading.** Start from the newest checkpoint and scan the commits after it, newest first, until the key appears; otherwise the checkpoint answers. A delete is recorded as a tombstone.
 - **Checkpoints.** Every `CHECKPOINT_INTERVAL` (100) commits, the writer that reaches the interval writes `checkpoints/<n>.json`: the full live state as of commit `n`. It is a pure function of the log, so concurrent writers of one produce the same file. A missed checkpoint is written by the next writer past it, in order. `Db::checkpoint()` does the same on demand.
 - **Caching.** Commits and checkpoints never change, so each `Db` caches what it has read and lists only the commits after the newest one it knows. A read costs one listing, one `HEAD` probe and the commits since the last checkpoint, at most 100.
+- **Cleanup.** `Db::cleanup(retention)` deletes every commit up to the newest checkpoint older than `retention`, in ascending order, then the checkpoints before it. Run it periodically from any node. `retention` must exceed the longest an operation may stall (plus clock skew against the store). An operation that stalls longer gets `Error::Expired`: in particular a writer that re-creates a deleted commit number notices (one `HEAD` of the previous commit per write) and does not report success.
 - **Failed writes.** Each write carries a random id. If the store reports a failure (even `AlreadyExists`), the writer later checks whether the commit at that number is its own, so a write that actually landed is never reported as failed or applied twice.
 
 The full design, its reasoning, and the review findings that shaped it are in [PLAN.md](PLAN.md).
@@ -135,7 +138,6 @@ The suite has been checked by mutation: disabling any safety mechanism makes at 
 
 ## Roadmap
 
-- **Phase 5:** cleanup of old commits after checkpointing.
 - **Phase 6:** `list(prefix)` and consistent snapshots.
 
 Details and later ideas (leases, watch) are in [PLAN.md](PLAN.md).

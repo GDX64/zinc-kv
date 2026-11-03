@@ -44,8 +44,9 @@ Where `zinc-kv` stands against production use. Checked items are done and tested
 ## Storage
 
 - [x] Checkpoints (Phase 4)
-- [ ] Cleanup of old commits (Phase 5)
-- [ ] Phantom-success protection during cleanup: `HEAD` of the next checkpoint after each `Create` (designed in PLAN.md, not built)
+- [x] Cleanup of old commits and checkpoints after a retention period (Phase 5)
+- [x] Phantom-success protection during cleanup: a writer that re-creates a cleaned-up commit gets `Expired` (one `HEAD` of the previous commit per write)
+- [ ] Retention limit documented against real stall times and clock skew on the deployment
 
 ## Backend
 

@@ -36,6 +36,12 @@ pub enum Error {
     /// version until commit, and the caller already knows it.
     #[error("key {key:?} was read after being written in the same transaction")]
     ReadAfterWrite { key: String },
+    /// The operation stalled for longer than the cleanup retention, so commits it depends
+    /// on are gone: a transaction's snapshot whose commits were deleted, or a write whose
+    /// commit number had already been cleaned up (it re-created a deleted commit that no
+    /// reader will see). Nothing visible was written.
+    #[error("commit {number} was already cleaned up")]
+    Expired { number: u64 },
     /// The write may or may not have been applied: an attempt failed in a way that could
     /// still have written its commit (now or later), and that could not be settled.
     ///
