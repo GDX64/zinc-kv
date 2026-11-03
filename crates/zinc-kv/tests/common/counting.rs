@@ -3,7 +3,7 @@
 
 use std::{
     fmt,
-    ops::Sub,
+    ops::{Add, Sub},
     sync::{Arc, Mutex},
 };
 
@@ -34,6 +34,20 @@ impl Calls {
     pub fn per_op(&self, ops: u64) -> [f64; 5] {
         let ops = ops as f64;
         [self.get, self.head, self.put, self.list, self.delete].map(|n| n as f64 / ops)
+    }
+}
+
+impl Add for Calls {
+    type Output = Calls;
+
+    fn add(self, other: Calls) -> Calls {
+        Calls {
+            get: self.get + other.get,
+            head: self.head + other.head,
+            put: self.put + other.put,
+            list: self.list + other.list,
+            delete: self.delete + other.delete,
+        }
     }
 }
 
