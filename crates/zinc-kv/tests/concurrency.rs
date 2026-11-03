@@ -4,12 +4,13 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use common::{open, store, text, BACKENDS};
-use zinc_kv::CasError;
+use zinc_kv::Error;
 
 /// Several "nodes" (separate `Db`s on one store) increment a shared counter with
-/// read + cas retry loops. Any lost update shows up as a total below the expected one.
+/// transactions, retrying on `Conflict`. Any lost update shows up as a total below the
+/// expected one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn concurrent_cas_increments_lose_nothing() {
+async fn concurrent_increments_lose_nothing() {
     const NODES: usize = 8;
     const INCREMENTS: usize = 20;
 
@@ -23,14 +24,15 @@ async fn concurrent_cas_increments_lose_nothing() {
                     let db = open(&store).await;
                     for _ in 0..INCREMENTS {
                         loop {
-                            let current = db.get("counter").await.unwrap();
-                            let (expected, n) = match &current {
-                                Some(e) => (Some(e.version), std::str::from_utf8(&e.value).unwrap().parse::<u64>().unwrap()),
-                                None => (None, 0),
+                            let mut tx = db.begin();
+                            let n = match tx.get("counter").await.unwrap() {
+                                Some(e) => std::str::from_utf8(&e.value).unwrap().parse::<u64>().unwrap(),
+                                None => 0,
                             };
-                            match db.cas("counter", expected, Some(Bytes::from((n + 1).to_string()))).await {
+                            tx.put("counter", Bytes::from((n + 1).to_string()));
+                            match tx.commit().await {
                                 Ok(_) => break,
-                                Err(CasError::Conflict { .. }) => continue,
+                                Err(Error::Conflict { .. }) => continue,
                                 Err(e) => panic!("{e}"),
                             }
                         }
@@ -61,9 +63,14 @@ async fn only_one_node_wins_the_lock() {
                 tokio::spawn(async move {
                     let db = open(&store).await;
                     let id = Bytes::from(format!("node-{i}"));
-                    match db.cas("leader", None, Some(id.clone())).await {
+                    let mut tx = db.begin();
+                    if tx.get("leader").await.unwrap().is_some() {
+                        return None;
+                    }
+                    tx.put("leader", id.clone());
+                    match tx.commit().await {
                         Ok(_) => Some(id),
-                        Err(CasError::Conflict { .. }) => None,
+                        Err(Error::Conflict { .. }) => None,
                         Err(e) => panic!("{e}"),
                     }
                 })

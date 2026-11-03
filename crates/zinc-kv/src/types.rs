@@ -17,3 +17,12 @@ pub struct Entry {
     pub value: Bytes,
     pub version: Version,
 }
+
+/// What a successful [`Tx::commit`](crate::Tx::commit) produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CommitResult {
+    /// The new version of every key the commit wrote, e.g. a new leader's fencing epoch.
+    /// `None` if the transaction wrote nothing, so no commit was made.
+    pub epoch: Option<Version>,
+}

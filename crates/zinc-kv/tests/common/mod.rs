@@ -17,7 +17,7 @@ use object_store::{
     PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
 };
 use tokio::sync::oneshot;
-use zinc_kv::Db;
+use zinc_kv::{Db, Version};
 
 pub const PREFIX: &str = "mesh";
 
@@ -71,6 +71,23 @@ pub fn commit_name(number: u64) -> String {
 
 pub fn text(s: &str) -> Bytes {
     Bytes::copy_from_slice(s.as_bytes())
+}
+
+/// The conditional write: a transaction that reads `key`, then writes `value` to it
+/// (`None` deletes). Returns the read entry and the new version.
+pub async fn update(
+    db: &Db,
+    key: &str,
+    value: Option<Bytes>,
+) -> zinc_kv::Result<(Option<zinc_kv::Entry>, Version)> {
+    let mut tx = db.begin();
+    let read = tx.get(key).await?;
+    match value {
+        Some(value) => tx.put(key, value),
+        None => tx.delete(key),
+    }
+    let epoch = tx.commit().await?.epoch.expect("the transaction wrote a key");
+    Ok((read, epoch))
 }
 
 /// What the next `PutMode::Create` does instead of a plain create.

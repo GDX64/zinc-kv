@@ -77,7 +77,7 @@ Tests (each on both backends unless noted):
 - **Model** (`tests/model.rs`): seeded random sequence of get/put/delete/cas (right and wrong expected versions) through several `Db`s on one store, checked against a `HashMap` model.
 
 ## Phase 4 — Read cost: cache and checkpoints
-Until now every operation lists the whole log, and a `get` of a missing key (or any `cas(None)` lock attempt) fetches *every* commit. This must be bounded before anything else is built on top.
+Until now every operation lists the whole log, and a `get` of a missing key (as in any lock attempt) fetches *every* commit. This must be bounded before anything else is built on top.
 - In-memory cache of commit files by number (safe since immutable); `list_with_offset` lists only commits newer than what is cached.
 - `checkpoint()`: N is always an exact multiple of a fixed `CHECKPOINT_INTERVAL` (e.g. 100), and checkpoint N is only written once checkpoint N − interval exists, so checkpoints exist in order with no gaps (Phase 5 relies on this). Read the previous checkpoint, replay commits up to N, write `checkpoints/<N>.json` (full live state, each key with its original version, no tombstones) with `PutMode::Create`. It is a pure function of the immutable log, so any node may write it and duplicate writers produce identical bytes; it never conflicts with commits.
 - Read: load newest checkpoint, replay commits after N; contiguity is then checked from N+1.
@@ -90,9 +90,40 @@ Until now every operation lists the whole log, and a `get` of a missing key (or 
 ## Phase 6 — `list(prefix)` and snapshots
 - `list(prefix)` merging newest-wins; `snapshot()` pinning a head number for consistent multi-reads.
 
+## Phase 7 — Multi-key transactions (done)
+Atomic writes to several keys, and consistent reads across them, without the caller handling versions. A transaction fails only if a key it read changed; it is tried once, and retrying is up to the caller. Built before Phase 4, so `tx.get` still scans the log. `cas` was removed: a transaction that reads a key and writes it is the same check, and one conditional-write path is easier to keep correct.
+
+API:
+- `db.begin() -> Tx`: no I/O.
+- `tx.get(key) -> Result<Option<Entry>>`: reads at the snapshot and adds the key to the *read set*, whether found or absent. `entry.version` is the commit that last wrote the key; if the transaction commits, it was still current at the commit. Reading a key already written in this transaction is `Error::ReadAfterWrite`: the buffered value has no version yet, and the caller knows it. A read that fails is not added to the read set.
+- `tx.put(key, value)`, `tx.delete(key)`: buffered, no I/O.
+- `tx.commit() -> Result<CommitResult>`: one commit file holding every buffered op. Dropping a `Tx` discards it.
+- `CommitResult { epoch: Option<Version> }`, `#[non_exhaustive]` so fields can be added later. `epoch` is the commit's number, which is the new version of every key it wrote (e.g. a new leader's fencing epoch); `None` when nothing was written and no commit file was created. Documented as the version of the written keys, not as a database version.
+- New `Error::Conflict { key }`: a key in the read set changed after the snapshot; nothing was written.
+
+Protocol:
+- **Snapshot**: the first `tx.get` fixes head S (listing, contiguity check and forward probe as usual); every read is at S.
+- **Commit** reuses `attempt_commits`, generalised from one `cas` key to the read set, with `checked` starting at S: find head H, settle uncertain numbers, then read commits `checked+1..=H`. Any op on a read-set key, including a rewrite of the same value or a tombstone → `Conflict`. Otherwise `Create` H+1. A lost race goes round the same loop and checks only the newer commits.
+- That loop is **not** a transaction retry: the caller's reads are never redone. It only moves the file write to a later number while the reads are still provably current. Without it, any write to an unrelated key would make a commit fail. Bounded by `MAX_ATTEMPTS` → `Contention`.
+- Empty read set (blind writes): no check, like `put`. Empty write set: `commit` writes nothing and returns `Ok`.
+- Sound for the same reasons `cas` was: the contiguity check and forward probe mean no commit after S is skipped, and settling before the check means our own commit is never taken for a conflict. Transactions are serializable: each commit is checked against every commit between its snapshot and its own number.
+
+Interactions:
+- Phase 4: the check reads only commits after S, cached once fetched. Build after Phase 4, since uncached `tx.get` scans the whole log and keeps transactions open longer.
+- Phase 5: a transaction open longer than the retention may find commits after S deleted. It cannot be checked, so `commit` returns a typed error, never success. The phantom-success `HEAD` check after `Create` applies to transaction commits too.
+- Phase 6: `snapshot()` becomes `begin()`. `list(prefix)` inside a transaction adds the prefix to the read set, so a key created under it later is a conflict.
+
+Tests (both backends):
+- Happy path; consistent multi-key reads.
+- A read key changed by another writer → `Conflict`, log unchanged. Same for a key read as absent that another writer creates, and for a tombstone.
+- An unrelated key written between snapshot and commit → commit succeeds at the later number.
+- Lost race at H+1 to an unrelated write → lands at H+2; to a write of a read key → `Conflict`.
+- Blind writes never conflict; read-only transactions write nothing.
+- `Create` lands but reports a failure → success, one commit file, no `Conflict` against ourselves.
+- Model test extended with transactions.
+
 ## Later (not planned yet)
-- Multi-key atomic transactions (a commit file already holds many ops).
-- Leases need no store support: put a deadline in the value; other nodes take over with `cas(Some(v))` once it has passed. Document the pattern.
+- Leases need no store support: put a deadline in the value; other nodes take over in a transaction that reads the lease, sees the deadline has passed and writes their own; a renewal in between is a `Conflict`. Document the pattern.
 - Watch: poll for `log/<head+1>` with a `HEAD` request rather than a listing.
 - Throughput non-goal: all writes serialise on one commit sequence, roughly one store round trip per commit — fine for coordination traffic.
 - S3: requirements above; not tested in this project.

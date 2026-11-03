@@ -10,16 +10,18 @@
 
 mod commit;
 mod error;
+mod tx;
 mod types;
 
-use std::{ops::RangeInclusive, sync::Arc, time::Duration};
+use std::{collections::HashSet, ops::RangeInclusive, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::{path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode};
 use rand::Rng;
 
-pub use error::{CasError, Error, Result};
-pub use types::{Entry, Version};
+pub use error::{Error, Result};
+pub use tx::Tx;
+pub use types::{CommitResult, Entry, Version};
 
 use commit::{Commit, Op};
 
@@ -41,12 +43,6 @@ struct Found {
     value: Option<Bytes>,
 }
 
-impl Found {
-    fn live_version(&self) -> Option<Version> {
-        self.value.as_ref().map(|_| self.version)
-    }
-}
-
 impl Db {
     pub async fn open(store: Arc<dyn ObjectStore>, prefix: Path) -> Result<Db> {
         Ok(Db { store, prefix })
@@ -54,6 +50,34 @@ impl Db {
 
     pub async fn get(&self, key: &str) -> Result<Option<Entry>> {
         let head = self.head().await?;
+        self.get_at(head, key).await
+    }
+
+    /// Unconditional write. Returns the new version.
+    pub async fn put(&self, key: &str, value: Bytes) -> Result<Version> {
+        let op = Op::Put {
+            key: key.to_owned(),
+            value,
+        };
+        self.commit(vec![op], &HashSet::new(), 0).await
+    }
+
+    /// Unconditional delete. Deleting a missing key still records a tombstone.
+    pub async fn delete(&self, key: &str) -> Result<()> {
+        let op = Op::Delete {
+            key: key.to_owned(),
+        };
+        self.commit(vec![op], &HashSet::new(), 0).await?;
+        Ok(())
+    }
+
+    /// Starts a transaction. No I/O until its first read.
+    pub fn begin(&self) -> Tx<'_> {
+        Tx::new(self)
+    }
+
+    /// `key` as of commit `head`.
+    async fn get_at(&self, head: u64, key: &str) -> Result<Option<Entry>> {
         let found = self.find(1..=head, key).await?;
         Ok(found.and_then(|f| {
             let version = f.version;
@@ -61,31 +85,8 @@ impl Db {
         }))
     }
 
-    /// Unconditional write. Returns the new version.
-    pub async fn put(&self, key: &str, value: Bytes) -> Result<Version> {
-        self.commit(key, None, Some(value))
-            .await
-            .map_err(unwrap_other)
-    }
-
-    /// Unconditional delete. Deleting a missing key still records a tombstone.
-    pub async fn delete(&self, key: &str) -> Result<()> {
-        self.commit(key, None, None).await.map_err(unwrap_other)?;
-        Ok(())
-    }
-
-    /// Compare-and-set. `expected: None` means the key must not exist.
-    /// `new: None` deletes the key. Returns the new version.
-    pub async fn cas(
-        &self,
-        key: &str,
-        expected: Option<Version>,
-        new: Option<Bytes>,
-    ) -> std::result::Result<Version, CasError> {
-        self.commit(key, Some(expected), new).await
-    }
-
-    /// `expected: None` skips the precondition check.
+    /// Appends one commit holding `ops`, failing with `Conflict` if a commit after
+    /// `snapshot` touches any key in `reads`. An empty `reads` checks nothing.
     ///
     /// A failed `Create`, even one reporting `AlreadyExists`, may still have written the
     /// commit (a lost response, a client retry), or may write it later (a request still in
@@ -93,52 +94,35 @@ impl Db {
     /// once the head reaches it, its `id` says whether the write was ours. A request can
     /// only ever land at the number it named, so this finds every write of ours that
     /// landed. Any error while a number is still uncertain becomes `OutcomeUnknown`.
-    async fn commit(
-        &self,
-        key: &str,
-        expected: Option<Option<Version>>,
-        new: Option<Bytes>,
-    ) -> std::result::Result<Version, CasError> {
-        let op = match new {
-            Some(value) => Op::Put {
-                key: key.to_owned(),
-                value,
-            },
-            None => Op::Delete {
-                key: key.to_owned(),
-            },
-        };
+    async fn commit(&self, ops: Vec<Op>, reads: &HashSet<String>, snapshot: u64) -> Result<Version> {
         let id = format!("{:032x}", rand::random::<u128>());
-        let payload = Bytes::from(
-            serde_json::to_vec(&Commit::new(id.clone(), vec![op])).map_err(Error::from)?,
-        );
+        let payload = Bytes::from(serde_json::to_vec(&Commit::new(id.clone(), ops))?);
 
         // Numbers whose `Create` failed and that were still free at the last head.
         let mut uncertain = Vec::new();
         match self
-            .attempt_commits(key, expected, &id, payload, &mut uncertain)
+            .attempt_commits(reads, snapshot, &id, payload, &mut uncertain)
             .await
         {
-            Err(CasError::Other(e)) if !uncertain.is_empty() => Err(Error::OutcomeUnknown {
+            Err(e) if !uncertain.is_empty() => Err(Error::OutcomeUnknown {
                 source: Box::new(e),
-            }
-            .into()),
+            }),
             result => result,
         }
     }
 
     async fn attempt_commits(
         &self,
-        key: &str,
-        expected: Option<Option<Version>>,
+        reads: &HashSet<String>,
+        snapshot: u64,
         id: &str,
         payload: Bytes,
         uncertain: &mut Vec<u64>,
-    ) -> std::result::Result<Version, CasError> {
-        // Commits up to `checked` are already reflected in `current` (for `cas`), and the
-        // head we append after has been decoded (for all writes).
-        let mut checked = 0;
-        let mut current = None;
+    ) -> Result<Version> {
+        // Commits up to `checked` are known not to touch `reads`, and the head we append
+        // after has been decoded (for all writes). Reads were made at `snapshot`, which the
+        // reads decoded; blind writes have checked nothing yet.
+        let mut checked = if reads.is_empty() { 0 } else { snapshot };
         let mut last_error: Option<StoreError> = None;
         for attempt in 0..MAX_ATTEMPTS {
             if attempt > 0 {
@@ -151,13 +135,10 @@ impl Db {
                 return Ok(Version::from_commit(number));
             }
 
-            if let Some(expected) = expected {
+            if !reads.is_empty() {
                 // Scans newest first, so this decodes the head commit too.
-                if let Some(found) = self.find(checked + 1..=head, key).await? {
-                    current = found.live_version();
-                }
-                if expected != current {
-                    return Err(CasError::Conflict { current });
+                if let Some(key) = self.touched(checked + 1..=head, reads).await? {
+                    return Err(Error::Conflict { key });
                 }
             } else if head > checked {
                 // Never append after a commit we cannot read: it may be damaged, or in a
@@ -192,7 +173,7 @@ impl Db {
         if let Some(number) = self.settle(uncertain, head, id).await? {
             return Ok(Version::from_commit(number));
         }
-        Err(last_error.map_or(Error::Contention, Error::from).into())
+        Err(last_error.map_or(Error::Contention, Error::from))
     }
 
     /// Settles the uncertain numbers that `head` has reached: a taken number is final,
@@ -223,6 +204,24 @@ impl Db {
                         Op::Delete { .. } => None,
                     },
                 }));
+            }
+        }
+        Ok(None)
+    }
+
+    /// A key from `keys` that one of the commits `numbers` writes, if any.
+    async fn touched(
+        &self,
+        numbers: RangeInclusive<u64>,
+        keys: &HashSet<String>,
+    ) -> Result<Option<String>> {
+        for number in numbers.rev() {
+            let commit = self
+                .read_commit(number)
+                .await?
+                .ok_or(Error::MissingCommit { number })?;
+            if let Some(op) = commit.ops.iter().find(|op| keys.contains(op.key())) {
+                return Ok(Some(op.key().to_owned()));
             }
         }
         Ok(None)
@@ -323,12 +322,4 @@ async fn backoff(attempt: u32) {
         .min(BACKOFF_CAP);
     let micros = rand::rng().random_range(0..=ceiling.as_micros() as u64);
     tokio::time::sleep(Duration::from_micros(micros)).await;
-}
-
-/// Unconditional ops never produce `Conflict`.
-fn unwrap_other(e: CasError) -> Error {
-    match e {
-        CasError::Other(e) => e,
-        CasError::Conflict { .. } => unreachable!("unconditional commit cannot conflict"),
-    }
 }

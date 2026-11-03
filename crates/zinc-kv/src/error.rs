@@ -1,5 +1,3 @@
-use crate::Version;
-
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("object store error: {0}")]
@@ -20,6 +18,14 @@ pub enum Error {
     /// the current head could be confirmed.
     #[error("gave up under contention from concurrent writers")]
     Contention,
+    /// A key the transaction read was written by another commit after the transaction's
+    /// snapshot. Nothing was written; retrying is up to the caller.
+    #[error("key {key:?} changed after the transaction read it")]
+    Conflict { key: String },
+    /// The transaction read a key it had already written. The buffered value has no
+    /// version until commit, and the caller already knows it.
+    #[error("key {key:?} was read after being written in the same transaction")]
+    ReadAfterWrite { key: String },
     /// The write may or may not have been applied: an attempt failed in a way that could
     /// still have written its commit (now or later), and that could not be settled.
     ///
@@ -33,12 +39,3 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
-
-#[derive(Debug, thiserror::Error)]
-pub enum CasError {
-    /// The key's current version did not match the expected one.
-    #[error("version mismatch, current version is {current:?}")]
-    Conflict { current: Option<Version> },
-    #[error(transparent)]
-    Other(#[from] Error),
-}

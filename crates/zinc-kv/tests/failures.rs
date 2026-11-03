@@ -6,10 +6,11 @@ mod common;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use common::{
-    commit_name, disk, log_files, open, store, text, CreateFault, FaultStore, BACKENDS, PREFIX,
+    commit_name, disk, log_files, open, store, text, update, CreateFault, FaultStore, BACKENDS,
+    PREFIX,
 };
 use object_store::{path::Path, ObjectStore, ObjectStoreExt};
-use zinc_kv::{CasError, Error};
+use zinc_kv::Error;
 
 /// A store on disk holding commits 1..=3 (put a, put b, put c), plus its log directory.
 async fn three_commits_on_disk(name: &str) -> (Arc<dyn ObjectStore>, PathBuf) {
@@ -29,13 +30,6 @@ fn assert_missing(result: Result<impl std::fmt::Debug, Error>, number: u64) {
     }
 }
 
-fn assert_cas_missing(result: Result<impl std::fmt::Debug, CasError>, number: u64) {
-    match result {
-        Err(CasError::Other(Error::MissingCommit { number: n })) if n == number => {}
-        other => panic!("expected MissingCommit {{ number: {number} }}, got {other:?}"),
-    }
-}
-
 /// A hole in the middle: even a key that lives in a newer commit is not read around it.
 #[tokio::test]
 async fn hole_in_log_is_an_error() {
@@ -48,7 +42,7 @@ async fn hole_in_log_is_an_error() {
     assert_missing(db.get("absent").await, 2);
     assert_missing(db.put("d", text("d")).await, 2);
     assert_missing(db.delete("a").await, 2);
-    assert_cas_missing(db.cas("absent", None, Some(text("x"))).await, 2);
+    assert_missing(update(&db, "absent", Some(text("x"))).await, 2);
     // Nothing was written past the hole.
     assert_eq!(log_files(&store).await, [commit_name(1), commit_name(3)]);
 }
@@ -61,7 +55,7 @@ async fn missing_first_commit_is_an_error() {
 
     assert_missing(db.get("c").await, 1);
     assert_missing(db.put("d", text("d")).await, 1);
-    assert_cas_missing(db.cas("a", None, Some(text("x"))).await, 1);
+    assert_missing(update(&db, "a", Some(text("x"))).await, 1);
 }
 
 /// A commit that is listed but gone by the time it is read.
@@ -78,7 +72,7 @@ async fn commit_vanishing_after_listing_is_an_error() {
         let db = open(&(faulty as Arc<dyn ObjectStore>)).await;
 
         assert_missing(db.get("a").await, 2);
-        assert_cas_missing(db.cas("a", None, Some(text("x"))).await, 2);
+        assert_missing(update(&db, "a", Some(text("x"))).await, 2);
         // Commit 3 alone answers for "c".
         assert_eq!(db.get("c").await.unwrap().unwrap().value, text("c"));
     }
@@ -96,8 +90,8 @@ async fn corrupt_commit_is_an_error() {
         db.get("a").await
     );
     assert!(matches!(
-        db.cas("a", None, Some(text("x"))).await,
-        Err(CasError::Other(Error::Corrupt { number: 2, .. }))
+        update(&db, "a", Some(text("x"))).await,
+        Err(Error::Corrupt { number: 2, .. })
     ));
     // Keys found before reaching the bad commit are still readable.
     assert_eq!(db.get("c").await.unwrap().unwrap().value, text("c"));
@@ -169,7 +163,8 @@ async fn landed_write_reported_as_error_succeeds_once() {
         let v1 = db.put("k", text("a")).await.unwrap();
 
         faulty.fail_next_create(CreateFault::FailAfterWrite);
-        let v2 = db.cas("k", Some(v1), Some(text("b"))).await.unwrap();
+        let (read, v2) = update(&db, "k", Some(text("b"))).await.unwrap();
+        assert_eq!(read.unwrap().version, v1);
 
         let entry = db.get("k").await.unwrap().unwrap();
         assert_eq!((entry.value, entry.version), (text("b"), v2), "{backend:?}");
@@ -187,7 +182,7 @@ async fn landed_write_reported_as_already_exists_succeeds_once() {
         let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
 
         faulty.fail_next_create(CreateFault::AlreadyExistsAfterWrite);
-        let v1 = db.cas("lock", None, Some(text("me"))).await.unwrap();
+        let (_, v1) = update(&db, "lock", Some(text("me"))).await.unwrap();
 
         faulty.fail_next_create(CreateFault::AlreadyExistsAfterWrite);
         let v2 = db.put("other", text("x")).await.unwrap();
@@ -195,6 +190,34 @@ async fn landed_write_reported_as_already_exists_succeeds_once() {
         assert!(v2 > v1);
         assert_eq!(db.get("lock").await.unwrap().unwrap().version, v1);
         assert_eq!(log_files(&inner).await.len(), 2, "{backend:?}");
+    }
+}
+
+/// A commit written after the transaction's snapshot is damaged. The commit-time check
+/// cannot tell whether it touches a read key, so it fails rather than append after it.
+#[tokio::test]
+async fn damaged_commit_after_snapshot_is_an_error() {
+    for backend in BACKENDS {
+        let store = store(backend, "damaged_after_snapshot");
+        let db = open(&store).await;
+        db.put("k", text("a")).await.unwrap();
+
+        let mut tx = db.begin();
+        tx.get("k").await.unwrap();
+        store
+            .put(
+                &Path::from(format!("{PREFIX}/log/{}", commit_name(2))),
+                text("not json").into(),
+            )
+            .await
+            .unwrap();
+        tx.put("k", text("b"));
+        let result = tx.commit().await;
+        assert!(
+            matches!(result, Err(Error::Corrupt { number: 2, .. })),
+            "{backend:?}: {result:?}"
+        );
+        assert_eq!(log_files(&store).await.len(), 2, "{backend:?}");
     }
 }
 
@@ -209,7 +232,8 @@ async fn transient_write_failure_is_retried() {
         faulty.fail_next_create(CreateFault::FailBeforeWrite);
         let v1 = db.put("k", text("a")).await.unwrap();
         faulty.fail_next_create(CreateFault::FailBeforeWrite);
-        let v2 = db.cas("k", Some(v1), Some(text("b"))).await.unwrap();
+        let (read, v2) = update(&db, "k", Some(text("b"))).await.unwrap();
+        assert_eq!(read.unwrap().version, v1);
 
         let entry = db.get("k").await.unwrap().unwrap();
         assert_eq!((entry.value, entry.version), (text("b"), v2), "{backend:?}");
@@ -232,9 +256,9 @@ async fn persistent_write_failure_is_outcome_unknown() {
             matches!(&result, Err(Error::OutcomeUnknown { source }) if matches!(**source, Error::Store(_))),
             "{result:?}"
         );
-        let result = db.cas("k", None, Some(text("a"))).await;
+        let result = update(&db, "k", Some(text("a"))).await;
         assert!(
-            matches!(&result, Err(CasError::Other(Error::OutcomeUnknown { .. }))),
+            matches!(&result, Err(Error::OutcomeUnknown { .. })),
             "{result:?}"
         );
         assert!(log_files(&inner).await.is_empty(), "{backend:?}");
@@ -291,12 +315,12 @@ async fn landed_write_on_final_attempt_is_recognised() {
                     .chain(std::iter::once(last)),
             );
 
-            let result = db.cas("lock", None, Some(text("me"))).await;
+            let result = update(&db, "lock", Some(text("me"))).await;
             assert_eq!(faulty.creates(), limit, "{backend:?}/{label}");
             let entry = open(&inner).await.get("lock").await.unwrap().unwrap();
             assert_eq!(entry.value, text("me"));
             assert!(
-                matches!(result, Ok(v) if v == entry.version),
+                matches!(result, Ok((None, v)) if v == entry.version),
                 "{backend:?}/{label}: {result:?}"
             );
             assert_eq!(log_files(&inner).await.len(), 1, "{backend:?}/{label}");
@@ -338,7 +362,7 @@ async fn write_landing_after_error_is_claimed() {
         let db = open(&(faulty.clone() as Arc<dyn ObjectStore>)).await;
 
         faulty.fail_next_create(CreateFault::FailThenLandLater);
-        let v1 = db.cas("lock", None, Some(text("me"))).await.unwrap();
+        let (_, v1) = update(&db, "lock", Some(text("me"))).await.unwrap();
 
         faulty.fail_next_create(CreateFault::FailThenLandLater);
         let v2 = db.put("k", text("a")).await.unwrap();
@@ -362,14 +386,14 @@ async fn unknown_write_can_land_after_an_absent_read() {
 
         faulty.fail_next_create(CreateFault::FailThenLandLater);
         let paused = faulty.pause_next_create();
-        let task = tokio::spawn(async move { writer.cas("lock", None, Some(text("me"))).await });
+        let task = tokio::spawn(async move { update(&writer, "lock", Some(text("me"))).await });
         paused.reached.await.unwrap();
         // Fail the writer's next listing, leaving the delayed Create unresolved.
         faulty.fail_list(true);
         paused.resume.send(()).unwrap();
         let result = task.await.unwrap();
         assert!(
-            matches!(result, Err(CasError::Other(Error::OutcomeUnknown { .. }))),
+            matches!(result, Err(Error::OutcomeUnknown { .. })),
             "{backend:?}: {result:?}"
         );
 
@@ -430,8 +454,8 @@ async fn failed_listing_returns_error() {
         assert!(matches!(db.get("k").await, Err(Error::Store(_))));
         assert!(matches!(db.put("k", text("b")).await, Err(Error::Store(_))));
         assert!(matches!(
-            db.cas("k", None, Some(text("b"))).await,
-            Err(CasError::Other(Error::Store(_)))
+            update(&db, "k", Some(text("b"))).await,
+            Err(Error::Store(_))
         ));
         assert_eq!(log_files(&inner).await.len(), 1, "{backend:?}");
 

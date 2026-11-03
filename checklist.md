@@ -7,7 +7,7 @@ Where `zinc-kv` stands against production use. Checked items are done and tested
 ## Correctness: write protocol
 
 - [x] One winner per commit number via atomic `PutMode::Create`
-- [x] `cas` precondition re-checked against newer commits after a lost race
+- [x] Transaction read set re-checked against newer commits after a lost race; losing to an unrelated key is not a conflict
 - [x] Writer recognises its own commit after a failed, `AlreadyExists`, or late-landing `Create` (no false failures, no duplicates)
 - [x] Final attempt's failure settled before giving up
 - [x] `Error::OutcomeUnknown` when a write may still land; docs say a later read is not conclusive
@@ -35,7 +35,7 @@ Where `zinc-kv` stands against production use. Checked items are done and tested
 
 ## Performance and cost
 
-- [ ] **Blocker:** bounded read cost. Today every operation lists the whole log, and a missing key or `cas(None)` reads every commit (Phase 4: checkpoints)
+- [ ] **Blocker:** bounded read cost. Today every operation lists the whole log, and a missing key (as in a lock attempt) reads every commit (Phase 4: checkpoints)
 - [ ] In-memory commit cache and `list_with_offset` (Phase 4)
 - [ ] Measured request count and latency per operation on S3
 - [ ] Estimate of request cost under polling load
@@ -56,11 +56,11 @@ Where `zinc-kv` stands against production use. Checked items are done and tested
 
 ## Features
 
-- [x] `get`, `put`, `delete`, `cas` with opaque, ordered `Version`
+- [x] `get`, `put`, `delete` and transactions with opaque, ordered `Version`
 - [ ] Lease or TTL support: a crashed lock holder holds the lock forever (pattern noted in PLAN.md only)
 - [ ] `list(prefix)` and snapshots (Phase 6)
 - [ ] Watch for changes (planned: poll for the next commit with `HEAD`)
-- [ ] Multi-key transactions
+- [x] Multi-key transactions, failing only when a key they read changed (Phase 7); `cas` removed
 
 ## Operations
 
