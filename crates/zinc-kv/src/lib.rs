@@ -4,22 +4,28 @@
 //! zero-padded sequence number. A commit wins by creating file `head + 1` with
 //! `PutMode::Create`; only one writer can create a given name. The number is the commit
 //! order and the version of every key the commit writes.
+//!
+//! The log must be the contiguous run `1..=head`. Anything else (a hole, an unreadable
+//! commit, an unknown format) is reported as an error rather than read around.
 
 mod commit;
 mod error;
 mod types;
 
-use std::sync::Arc;
+use std::{ops::RangeInclusive, sync::Arc, time::Duration};
 
 use bytes::Bytes;
 use object_store::{path::Path, Error as StoreError, ObjectStore, ObjectStoreExt, PutMode};
+use rand::Rng;
 
 pub use error::{CasError, Error, Result};
 pub use types::{Entry, Version};
 
 use commit::{Commit, Op};
 
-const MAX_ATTEMPTS: usize = 64;
+const MAX_ATTEMPTS: u32 = 64;
+const BACKOFF_BASE: Duration = Duration::from_millis(1);
+const BACKOFF_CAP: Duration = Duration::from_millis(32);
 
 pub struct Db {
     store: Arc<dyn ObjectStore>,
@@ -45,8 +51,8 @@ impl Db {
     }
 
     pub async fn get(&self, key: &str) -> Result<Option<Entry>> {
-        let commits = self.list_commits().await?;
-        let found = self.find(&commits, key).await?;
+        let head = self.head().await?;
+        let found = self.find(1..=head, key).await?;
         Ok(found.and_then(|f| {
             let version = f.version;
             f.value.map(|value| Entry { value, version })
@@ -60,7 +66,7 @@ impl Db {
             .map_err(unwrap_other)
     }
 
-    /// Unconditional delete.
+    /// Unconditional delete. Deleting a missing key still records a tombstone.
     pub async fn delete(&self, key: &str) -> Result<()> {
         self.commit(key, None, None).await.map_err(unwrap_other)?;
         Ok(())
@@ -78,6 +84,14 @@ impl Db {
     }
 
     /// `expected: None` skips the precondition check.
+    ///
+    /// A failed `Create`, even one reporting `AlreadyExists`, may still have written the
+    /// commit (a lost response, a client retry), or may write it later (a request still in
+    /// flight). So every failed number is kept as *uncertain* and retried like a lost race;
+    /// once a later listing shows it taken, its `id` says whether the write was ours. A request can only ever land at the
+    /// number it named, so this finds every write of ours that landed. If the attempts
+    /// run out, the last store error is returned and the outcome is unknown only if a
+    /// request may still land later (never on `InMemory` or `LocalFileSystem`).
     async fn commit(
         &self,
         key: &str,
@@ -93,18 +107,34 @@ impl Db {
                 key: key.to_owned(),
             },
         };
-        let payload = Bytes::from(serde_json::to_vec(&Commit { ops: vec![op] }).map_err(Error::from)?);
+        let id = format!("{:032x}", rand::random::<u128>());
+        let payload = Bytes::from(
+            serde_json::to_vec(&Commit::new(id.clone(), vec![op])).map_err(Error::from)?,
+        );
 
         // Commits up to `checked` are already reflected in `current`.
         let mut checked = 0;
         let mut current = None;
-        for _ in 0..MAX_ATTEMPTS {
-            let commits = self.list_commits().await?;
-            let head = commits.last().copied().unwrap_or(0);
+        // Numbers whose `Create` failed and that were still free at the last listing.
+        let mut uncertain: Vec<u64> = Vec::new();
+        let mut last_error: Option<StoreError> = None;
+        for attempt in 0..MAX_ATTEMPTS {
+            if attempt > 0 {
+                backoff(attempt).await;
+            }
+            let head = self.head().await?;
+
+            // A taken number is final: ours or another writer's. Checked before the
+            // precondition, so that our own commit is never mistaken for a conflicting one.
+            for &number in uncertain.iter().filter(|&&n| n <= head) {
+                if self.is_ours(number, &id).await? {
+                    return Ok(Version::from_commit(number));
+                }
+            }
+            uncertain.retain(|&n| n > head);
 
             if let Some(expected) = expected {
-                let unseen: Vec<u64> = commits.iter().copied().filter(|&n| n > checked).collect();
-                if let Some(found) = self.find(&unseen, key).await? {
+                if let Some(found) = self.find(checked + 1..=head, key).await? {
                     current = found.live_version();
                 }
                 checked = head;
@@ -113,23 +143,38 @@ impl Db {
                 }
             }
 
-            if self.create_commit(head + 1, payload.clone()).await? {
-                return Ok(Version::from_commit(head + 1));
+            let number = head + 1;
+            match self.create_commit(number, payload.clone()).await {
+                Ok(()) => return Ok(Version::from_commit(number)),
+                // Usually another writer won `number` (`AlreadyExists`, or on Windows'
+                // `LocalFileSystem` sometimes a plain error). But the failure may hide a
+                // write of ours: a lost response, a client retry of a request that had
+                // landed, or a request still in flight. The next pass settles it.
+                Err(e) => {
+                    if !uncertain.contains(&number) {
+                        uncertain.push(number);
+                    }
+                    last_error = match e {
+                        StoreError::AlreadyExists { .. } => None,
+                        e => Some(e),
+                    };
+                }
             }
-            // Lost the race for `head + 1`: list again and retry.
         }
-        Err(Error::Contention.into())
+        Err(last_error.map_or(Error::Contention, Error::from).into())
     }
 
-    /// Newest entry for `key` among the commits `numbers` (ascending).
-    async fn find(&self, numbers: &[u64], key: &str) -> Result<Option<Found>> {
-        for &n in numbers.iter().rev() {
-            let bytes = self.store.get(&self.commit_path(n)).await?.bytes().await?;
-            let commit: Commit = serde_json::from_slice(&bytes)?;
+    /// Newest entry for `key` among the commits `numbers`.
+    async fn find(&self, numbers: RangeInclusive<u64>, key: &str) -> Result<Option<Found>> {
+        for number in numbers.rev() {
+            let commit = self
+                .read_commit(number)
+                .await?
+                .ok_or(Error::MissingCommit { number })?;
             // A commit may mention a key more than once; the last op wins.
             if let Some(op) = commit.ops.into_iter().rev().find(|op| op.key() == key) {
                 return Ok(Some(Found {
-                    version: Version::from_commit(n),
+                    version: Version::from_commit(number),
                     value: match op {
                         Op::Put { value, .. } => Some(value),
                         Op::Delete { .. } => None,
@@ -140,17 +185,41 @@ impl Db {
         Ok(None)
     }
 
-    /// Commit numbers present in the log, ascending.
-    async fn list_commits(&self) -> Result<Vec<u64>> {
+    /// Number of the newest commit (0 for an empty log), after checking that the log is
+    /// exactly `1..=head`.
+    async fn head(&self) -> Result<u64> {
         let dir = self.prefix.clone().join("log");
         let listing = self.store.list_with_delimiter(Some(&dir)).await?;
         let mut numbers: Vec<u64> = listing
             .objects
             .iter()
-            .filter_map(|o| o.location.filename()?.strip_suffix(".json")?.parse().ok())
+            .filter_map(|o| parse_commit_name(o.location.filename()?))
             .collect();
         numbers.sort_unstable();
-        Ok(numbers)
+        for (expected, &n) in (1..).zip(&numbers) {
+            if n != expected {
+                return Err(Error::MissingCommit { number: expected });
+            }
+        }
+        Ok(numbers.len() as u64)
+    }
+
+    /// `None` if the commit does not exist.
+    async fn read_commit(&self, number: u64) -> Result<Option<Commit>> {
+        let bytes = match self.store.get(&self.commit_path(number)).await {
+            Ok(result) => result.bytes().await?,
+            Err(StoreError::NotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Commit::decode(number, &bytes).map(Some)
+    }
+
+    /// Whether commit `number` exists and was written by the attempt `id`.
+    async fn is_ours(&self, number: u64, id: &str) -> Result<bool> {
+        Ok(self
+            .read_commit(number)
+            .await?
+            .is_some_and(|commit| commit.id == id))
     }
 
     fn commit_path(&self, number: u64) -> Path {
@@ -160,22 +229,34 @@ impl Db {
             .join(format!("{number:020}.json"))
     }
 
-    /// Returns `false` if another writer already created this commit number.
-    async fn create_commit(&self, number: u64, payload: Bytes) -> Result<bool> {
-        match self
-            .store
+    async fn create_commit(&self, number: u64, payload: Bytes) -> object_store::Result<()> {
+        self.store
             .put_opts(
                 &self.commit_path(number),
                 payload.into(),
                 PutMode::Create.into(),
             )
             .await
-        {
-            Ok(_) => Ok(true),
-            Err(StoreError::AlreadyExists { .. }) => Ok(false),
-            Err(e) => Err(e.into()),
-        }
+            .map(|_| ())
     }
+}
+
+/// Only `<20 digits>.json` names a commit; anything else in `log/` is ignored.
+fn parse_commit_name(name: &str) -> Option<u64> {
+    let stem = name.strip_suffix(".json")?;
+    if stem.len() != 20 || !stem.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    stem.parse().ok()
+}
+
+/// Full-jitter exponential backoff before retry `attempt` (1-based).
+async fn backoff(attempt: u32) {
+    let ceiling = BACKOFF_BASE
+        .saturating_mul(1 << (attempt - 1).min(16))
+        .min(BACKOFF_CAP);
+    let micros = rand::rng().random_range(0..=ceiling.as_micros() as u64);
+    tokio::time::sleep(Duration::from_micros(micros)).await;
 }
 
 /// Unconditional ops never produce `Conflict`.

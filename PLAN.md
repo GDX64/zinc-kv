@@ -1,11 +1,22 @@
 # blob-zinc: KV store on `object_store` — phased plan
 
 ## Context
-Nodes in a distributed mesh need a shared, strongly consistent place to coordinate (leases, leader election, config). Build a small embedded Rust library whose only shared dependency is an `object_store` backend. Correctness rests on a single primitive: create-if-absent (`PutMode::Create`). Workspace `c:\projects\blob-zinc` is a Cargo workspace.
+Nodes in a distributed mesh need a shared, strongly consistent place to coordinate (leases, leader election, config). Build a small embedded Rust library whose only shared dependency is an `object_store` backend.
 
-Decisions: Delta-Lake-style layout (numbered, immutable commit files; compaction by checkpoints); backends S3 + LocalFileSystem + InMemory; semantics = get/put/delete + CAS on version. We go one phase at a time, smallest viable step first. Each phase is shippable and has its own tests.
+Decisions: Delta-Lake-style layout (numbered, immutable commit files; compaction by checkpoints); semantics = get/put/delete + CAS on version. Tested backends: `InMemory` and `LocalFileSystem` only; we do not test against real S3. We go one phase at a time, smallest viable step first. Each phase is shippable and has its own tests.
 
 History: Phase 1 used one object replaced with `PutMode::Update`; Phase 2 first split it into a manifest + segments. Both needed conditional *update*, which `LocalFileSystem` lacks (hence the test-only `zinc-fs` crate). We switched to the numbered-commit layout, which needs only `Create`, works on every backend, and leaves no orphan files.
+
+### Reliability rules
+Top priority: this crate must not return a wrong answer.
+- Prefer an error to a guess. Anything unexpected in the log (gap, unreadable file, unknown format) is a typed error, never treated as "key absent".
+- Every write outcome is determinable: a writer recognises its own commit even when the store reports a failure or `AlreadyExists` for a write that actually landed.
+- Retries are bounded and backed off; giving up is a typed error.
+
+### Backend requirements
+1. `PutMode::Create` is atomic: at most one writer creates a given name.
+2. Listing returns a contiguous run of commits. A stale listing (missing the newest commits) is safe for writes — the `Create` of an existing number fails. A listing with a *hole* is not: a `cas` would skip the missing commit when checking its precondition. So the code checks contiguity and errors on a hole.
+3. Linearizable `get` additionally needs read-after-write listing (true for `InMemory`, `LocalFileSystem`, and AWS S3).
 
 ---
 
@@ -16,49 +27,74 @@ Cargo workspace (`Cargo.toml` at root, shared `[workspace.dependencies]`), crate
 Whole DB in one `state.json`, read-modify-write with `PutMode::Update`. Established the public API:
 `Db::open(Arc<dyn ObjectStore>, Path)`, `get`, `put`, `delete`, `cas(key, expected: Option<Version>, new: Option<Bytes>) -> Result<Version, CasError>`. `Version` is an opaque newtype over `u64` (private field); `put` returns `Version`; `Entry { value, version }`. `expected: None` = key must not exist (lock/leader election); `new: None` deletes.
 
-## Phase 2 — Numbered commit log (Delta style)
+## Phase 2 — Numbered commit log, Delta style (done)
 ```
 <prefix>/log/00000000000000000001.json     one immutable commit per file, 20-digit zero-padded
 <prefix>/log/00000000000000000002.json
 ```
-A commit file is `{"ops":[{"op":"put","key":..,"value":<base64>} | {"op":"delete","key":..}]}`. The file number *is* the commit order and the **version** of every key it writes.
-- Commit: list `log/`, head = highest number (0 if empty); check the `cas` precondition; `PutMode::Create` of `head+1`. `AlreadyExists` → someone else won: list again, re-check the precondition against only the commits newer than the last one checked, retry with the new head (bounded). No separate manifest, no orphans.
-- Read: list `log/`, scan commits newest→oldest until the key is found. A `delete` op is a tombstone: the key reads as absent and counts as "must not exist" for `cas`.
-- API unchanged; Phase 1 behavior tests must still pass untouched.
-- Known costs (addressed in later phases): every read lists and fetches commits (Phase 3 cache, Phase 4 checkpoints); retries have no backoff.
+The file number *is* the commit order and the **version** of every key it writes.
+- Commit: list `log/`, head = highest number (0 if empty); check the `cas` precondition; `PutMode::Create` of `head+1`. `AlreadyExists` → someone else won: list again, re-check the precondition against only the commits newer than the last one checked, retry with the new head (bounded).
+- Read: list `log/`, scan commits newest→oldest until the key is found. A `delete` op is a tombstone: the key reads as absent and counts as "must not exist" for `cas`. Deleting a missing key still writes a tombstone (harmless, gives the delete a definite position in the log).
+- Layout test: `tests/layout.rs` on `LocalFileSystem` under `target/tmp/layout`: the prefix holds only the `log/` directory, which holds one file per write.
 
-Tests:
-- **Layout**: `tests/layout.rs`, on plain `LocalFileSystem` under `target/tmp/layout`, left on disk for inspection. Checks only that `log/` holds one file per commit and that there is no `manifest.json`/`state.json`. Does not parse contents.
-- **Commit path**
-  1. Stale `cas` returns `Conflict` with the correct `current` version.
-  2. Delete then `cas(key, None, …)` recreates the key (tombstone counts as absent) with a higher version than before.
-  3. Retry-window conflict detection: A computes its precondition, B commits to the same key before A's `Create` → A gets `Conflict`; if B changed a different key, A succeeds with the next number.
-- **Failure handling**
-  4. A gap or a missing commit file referenced by a listing makes `get` return an error, not `None`.
-- **Concurrency**
-  5. Counter and lock tests (exist) also run on `LocalFileSystem`.
-  6. Mixed workload: concurrent writers on different keys plus deletes; every key ends at its last written value.
-- Later: a model-based test comparing `Db` against a `HashMap` under random operations.
+## Phase 3 — Hardening (done)
+Code:
+- **Contiguity**: the listing must be exactly `1..=head`; otherwise `Error::MissingCommit`. A file that is listed but then not found is the same error.
+- **Strict names**: only `<20 digits>.json` counts as a commit; other objects in `log/` are ignored.
+- **Commit format** `{"v":1,"id":"<random 128-bit hex>","ops":[...]}`. Unknown `v` → `Error::UnsupportedFormat`; unparseable file → `Error::Corrupt`. `deny_unknown_fields`.
+- **Ambiguous writes**: `id` is unique per `commit()` call and reused across its retries. Any failed `Create` (including `AlreadyExists`) may hide a write of ours — a lost response, a client retry of a request that had landed, a request still in flight. The number is kept as *uncertain* and retried like a lost race; on each pass, every uncertain number the listing now shows as taken is read, and if it carries our `id` the write succeeded. This runs before the precondition check, so a writer never reports `Conflict` against its own commit. A request can only land at the number it named, so no landed write of ours is missed or duplicated.
+- **Errors are retried**: `LocalFileSystem` on Windows reports a plain error (staging-file `Access is denied`) instead of `AlreadyExists` when two writers race for the same number — found by running the concurrency tests on disk. So `Create` errors are retried like lost races; when attempts run out, the last store error is returned (or `Contention` if the last failures were lost races). Listing and read errors are returned immediately.
+- **Backoff**: full-jitter exponential backoff between attempts (1 ms doubling, capped at 32 ms), bounded by `MAX_ATTEMPTS`.
 
-## Phase 3 — Reads: `list(prefix)`, snapshots, cache
-- `list(prefix)` merging newest-wins; `snapshot()` pinning a head for consistent multi-reads.
-- In-memory cache of commit files by number (safe since immutable); use `list_with_offset` to list only commits newer than what is cached.
+Test support: `tests/common/mod.rs` with a fault-injecting `ObjectStore` wrapper (pause before a commit `Create`; make the next or every `Create` fail before writing, after writing, report `AlreadyExists` after writing, or land only at the next listing; let a competitor steal every number; fail listing; make a listed file unreadable), plus helpers to run a test on both `InMemory` and `LocalFileSystem`.
 
-## Phase 4 — Checkpoints and cleanup
-- `checkpoint()`: pick N (e.g. every 100 commits), read the previous checkpoint, replay commits up to N, write `checkpoints/<N>.json` (full live state, each key with its original version, no tombstones) with `PutMode::Create`. It is a pure function of the immutable log, so any node may write it and duplicate writers produce identical bytes; it never conflicts with commits. Optional best-effort `checkpoints/_last` hint.
-- Read: load newest checkpoint, replay commits after N. A reader that hits a missing commit reloads from the newest checkpoint.
-- `cleanup(retention)`: delete commits ≤ N and older checkpoints **only after a long retention period**. **Hazard:** deleting `log/K` makes `Create log/K` succeed again, so a writer paused longer than the retention could fork the history. Retention must exceed any plausible writer pause; document this limit. (A mitigation to consider: writers re-list the head right before `Create` and refuse to create a number below the newest checkpoint.)
+The suite was checked by mutation: disabling the contiguity check, the precondition recheck, the uncertain-number check, or error retries each makes at least one test fail.
 
-## Phase 5 — Real S3 validation
-- Run the suite against MinIO/S3 (`PutMode::Create` via `If-None-Match`); document backend requirements/caveats.
+Tests (each on both backends unless noted):
+- **Commit path** (`tests/commit_path.rs`)
+  1. Stale `cas` returns `Conflict` with the correct `current` version; `current: None` after a delete.
+  2. Delete then `cas(key, None, …)` recreates the key with a higher version.
+  3. Retry window: A has checked its precondition; B commits to the same key before A's `Create` → A gets `Conflict` and writes nothing.
+  4. Retry window, different key: B changes another key → A rechecks only the newer commit and succeeds with the next number.
+  5. Unconditional `put` retries through a lost race.
+  6. `cas` delete (`new: None`) with right/wrong version.
+- **Failure handling** (`tests/failures.rs`, on disk where files are tampered with)
+  7. A hole in the log (missing middle or first commit) makes `get`, `put` and `cas` return `MissingCommit`, never `None`; a commit that is listed but unreadable likewise.
+  8. Corrupt commit file or unknown field → `Corrupt`; unknown format version → `UnsupportedFormat`.
+  9. Stray objects in `log/` (`notes.txt`, `3.json`) are ignored.
+  10. `Create` writes but reports an error → `put`/`cas` succeed exactly once (one commit file).
+  11. `Create` writes but reports `AlreadyExists` → success, not `Conflict`.
+  12. `Create` fails once without writing → retried, lands once. Fails every time → the store error is returned, the log is unchanged.
+  13. `Create` fails, then the request lands before the next listing → claimed as ours: no duplicate, no `Conflict`.
+  14. Listing fails → error returned.
+  15. Every number is stolen by a competitor → `Contention` after a bounded time.
+- **Concurrency** (`tests/concurrency.rs`, both backends)
+  16. Counter and lock tests.
+  17. Mixed workload: concurrent writers on different keys plus deletes; every key ends at its last written value; versions per key strictly increase.
+- **Model** (`tests/model.rs`): seeded random sequence of get/put/delete/cas (right and wrong expected versions) through several `Db`s on one store, checked against a `HashMap` model.
+
+## Phase 4 — Read cost: cache and checkpoints
+Until now every operation lists the whole log, and a `get` of a missing key (or any `cas(None)` lock attempt) fetches *every* commit. This must be bounded before anything else is built on top.
+- In-memory cache of commit files by number (safe since immutable); `list_with_offset` lists only commits newer than what is cached.
+- `checkpoint()`: pick N (e.g. every 100 commits), read the previous checkpoint, replay commits up to N, write `checkpoints/<N>.json` (full live state, each key with its original version, no tombstones) with `PutMode::Create`. It is a pure function of the immutable log, so any node may write it and duplicate writers produce identical bytes; it never conflicts with commits.
+- Read: load newest checkpoint, replay commits after N; contiguity is then checked from N+1.
+
+## Phase 5 — Cleanup
+- `cleanup(retention)`: delete commits ≤ N and older checkpoints only after a long retention period.
+- **Hazard — phantom success**: deleting `log/K` makes `Create log/K` succeed again. A writer paused longer than the retention can create `log/K ≤ N`. Readers start from checkpoint N and never see it, so the writer gets `Ok(version)` ("I hold the lock") for a write nobody observes. Re-listing before `Create` does not close this (check-then-act). **Mitigation**: after a successful `Create` of K, the writer lists `checkpoints/`; if a checkpoint ≥ K exists, it returns an error instead of success. Retention must still exceed plausible pauses; document the limit.
+
+## Phase 6 — `list(prefix)` and snapshots
+- `list(prefix)` merging newest-wins; `snapshot()` pinning a head number for consistent multi-reads.
 
 ## Later (not planned yet)
-Multi-key atomic transactions (a commit file already holds many ops), TTL/leases, watch via polling the head.
+- Multi-key atomic transactions (a commit file already holds many ops).
+- Leases need no store support: put a deadline in the value; other nodes take over with `cas(Some(v))` once it has passed. Document the pattern.
+- Watch: poll for `log/<head+1>` with a `HEAD` request rather than a listing.
+- Throughput non-goal: all writes serialise on one commit sequence, roughly one store round trip per commit — fine for coordination traffic.
+- S3: requirements above; not tested in this project.
 
 ---
 
-## Verification (applies from Phase 1 onward)
-- `cargo test`, suite on `InMemory` and `LocalFileSystem`.
-- Counter test: several `Db` instances sharing one store (simulating nodes) CAS-increment one key; final value equals total increments.
-- Lock test: many tasks race `cas(key, None, id)`; exactly one wins.
-- Basic semantics: get-missing, put/get, delete, CAS mismatch returns current version.
+## Verification
+- `cargo test`: the suite runs on `InMemory` and `LocalFileSystem`.
+- Concurrency tests are stress-run repeatedly before a phase is marked done.
