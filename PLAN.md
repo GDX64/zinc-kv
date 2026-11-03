@@ -26,6 +26,22 @@ Replace `state.json` with `manifest.json` (`{epoch, segments:[{path, commit_epoc
 - Commit: upload segment (`PutMode::Create`), CAS manifest; on conflict re-validate CAS preconditions against only the newly added segments, retry manifest write reusing the segment.
 - Read: manifest GET, scan segments newest→oldest. Tombstones for deletes.
 - API unchanged; Phase 1 tests must still pass untouched.
+- Segments carry no epoch; the manifest's `SegmentRef.commit_epoch` is the source of truth, so a retry after a lost race can reuse the uploaded segment. Segment ids are UUID v7.
+
+Tests (in priority order within each group):
+- **Layout** *(written first)*: `tests/layout.rs`, on `CasLocalFileSystem` under `target/tmp/layout`, left on disk for inspection. Checks only that `manifest.json` exists, `state.json` does not, and `segments/` holds one file per commit. Does not parse contents.
+- **Commit path**
+  1. Stale `cas` returns `Conflict` with the correct `current` version.
+  2. Delete then `cas(key, None, …)` recreates the key (tombstone counts as absent) with a higher version than before.
+  3. Retry reuses the segment: a store wrapper fails the first manifest `Update`; exactly one segment exists afterwards.
+  4. Retry-window conflict detection: A reads, B commits to the same key, A's manifest write fails → A gets `Conflict`; if B changed a different key, A succeeds.
+- **Failure handling**
+  5. A segment no manifest references (crashed writer) is invisible to reads.
+  6. A manifest referencing a missing segment makes `get` return an error, not `None`.
+- **Concurrency**
+  7. Rerun the counter and lock tests on `CasLocalFileSystem`.
+  8. Mixed workload: concurrent writers on different keys plus deletes; every key ends at its last written value.
+- Later: a model-based test comparing `Db` against a `HashMap` under random operations.
 
 ## Phase 3 — Reads: `list(prefix)`, snapshots, segment cache
 - `list(prefix)` merging newest-wins; `snapshot()` pinning a manifest for consistent multi-reads.
