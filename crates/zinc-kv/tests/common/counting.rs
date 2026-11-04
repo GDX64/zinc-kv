@@ -5,10 +5,11 @@ use std::{
     fmt,
     ops::{Add, Sub},
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
-use futures::stream::{BoxStream, StreamExt};
+use futures::stream::{self, BoxStream, StreamExt};
 use object_store::{
     path::Path, CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta,
     ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult, RenameOptions, Result,
@@ -99,17 +100,33 @@ impl CostModel {
     }
 }
 
-/// Wraps a store and counts every request that reaches it.
+/// Waits `delay` precisely. A timer sleep would round up to the OS timer resolution (about
+/// 15 ms on Windows), so this yields to other tasks until the deadline instead, at the cost
+/// of CPU while waiting.
+pub async fn wait(delay: Duration) {
+    if !delay.is_zero() {
+        tokio::time::sleep(delay).await;
+    }
+}
+
+/// Wraps a store and counts every request that reaches it, optionally holding each one for
+/// a fixed delay first, like a remote store's round trip.
 pub struct CountingStore {
     inner: Arc<dyn ObjectStore>,
     calls: Arc<Mutex<Calls>>,
+    delay: Duration,
 }
 
 impl CountingStore {
     pub fn new(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
+        Self::with_delay(inner, Duration::ZERO)
+    }
+
+    pub fn with_delay(inner: Arc<dyn ObjectStore>, delay: Duration) -> Arc<Self> {
         Arc::new(CountingStore {
             inner,
             calls: Arc::default(),
+            delay,
         })
     }
 
@@ -119,6 +136,20 @@ impl CountingStore {
 
     fn count(&self, f: impl FnOnce(&mut Calls)) {
         f(&mut self.calls.lock().unwrap());
+    }
+
+    /// A listing that starts only after the delay.
+    fn delayed(
+        &self,
+        listing: BoxStream<'static, Result<ObjectMeta>>,
+    ) -> BoxStream<'static, Result<ObjectMeta>> {
+        let delay = self.delay;
+        stream::once(async move {
+            wait(delay).await;
+            listing
+        })
+        .flatten()
+        .boxed()
     }
 }
 
@@ -143,6 +174,7 @@ impl ObjectStore for CountingStore {
         opts: PutOptions,
     ) -> Result<PutResult> {
         self.count(|c| c.put += 1);
+        wait(self.delay).await;
         self.inner.put_opts(location, payload, opts).await
     }
 
@@ -152,6 +184,7 @@ impl ObjectStore for CountingStore {
         opts: PutMultipartOptions,
     ) -> Result<Box<dyn MultipartUpload>> {
         self.count(|c| c.put += 1);
+        wait(self.delay).await;
         self.inner.put_multipart_opts(location, opts).await
     }
 
@@ -163,6 +196,7 @@ impl ObjectStore for CountingStore {
                 c.get += 1
             }
         });
+        wait(self.delay).await;
         self.inner.get_opts(location, options).await
     }
 
@@ -171,15 +205,20 @@ impl ObjectStore for CountingStore {
         locations: BoxStream<'static, Result<Path>>,
     ) -> BoxStream<'static, Result<Path>> {
         let calls = self.calls.clone();
+        let delay = self.delay;
         let counted = locations
             .inspect(move |_| calls.lock().unwrap().delete += 1)
+            .then(move |location| async move {
+                wait(delay).await;
+                location
+            })
             .boxed();
         self.inner.delete_stream(counted)
     }
 
     fn list(&self, prefix: Option<&Path>) -> BoxStream<'static, Result<ObjectMeta>> {
         self.count(|c| c.list += 1);
-        self.inner.list(prefix)
+        self.delayed(self.inner.list(prefix))
     }
 
     fn list_with_offset(
@@ -188,21 +227,24 @@ impl ObjectStore for CountingStore {
         offset: &Path,
     ) -> BoxStream<'static, Result<ObjectMeta>> {
         self.count(|c| c.list += 1);
-        self.inner.list_with_offset(prefix, offset)
+        self.delayed(self.inner.list_with_offset(prefix, offset))
     }
 
     async fn list_with_delimiter(&self, prefix: Option<&Path>) -> Result<ListResult> {
         self.count(|c| c.list += 1);
+        wait(self.delay).await;
         self.inner.list_with_delimiter(prefix).await
     }
 
     async fn copy_opts(&self, from: &Path, to: &Path, options: CopyOptions) -> Result<()> {
         self.count(|c| c.put += 1);
+        wait(self.delay).await;
         self.inner.copy_opts(from, to, options).await
     }
 
     async fn rename_opts(&self, from: &Path, to: &Path, options: RenameOptions) -> Result<()> {
         self.count(|c| c.put += 1);
+        wait(self.delay).await;
         self.inner.rename_opts(from, to, options).await
     }
 }

@@ -1,0 +1,388 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>zinc-kv timeline</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface-1: #fcfcfb;
+    --text-primary: #0b0b0b;
+    --text-secondary: #52514e;
+    --text-muted: #6f6e69;
+    --grid: #e1e0d9;
+    --rule: #b9b8b0;
+    --accent: #2a78d6;
+    --series-1: #2a78d6;
+    --series-2: #eb6834;
+    --series-3: #1baf7a;
+    --series-4: #eda100;
+    --series-5: #e87ba4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface-1: #1a1a19;
+      --text-primary: #f0efec;
+      --text-secondary: #c3c2b7;
+      --text-muted: #9a998f;
+      --grid: #2c2c2a;
+      --rule: #5a5954;
+      --accent: #3987e5;
+      --series-1: #3987e5;
+      --series-2: #d95926;
+      --series-3: #199e70;
+      --series-4: #c98500;
+      --series-5: #d55181;
+    }
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --text-primary: #f0efec;
+    --text-secondary: #c3c2b7;
+    --text-muted: #9a998f;
+    --grid: #2c2c2a;
+    --rule: #5a5954;
+    --accent: #3987e5;
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    padding: 24px 16px 48px;
+    background: var(--page);
+    color: var(--text-primary);
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1200px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--text-secondary); margin: 0 0 16px; }
+  .switcher { display: inline-flex; flex-wrap: wrap; max-width: 100%; border: 1px solid var(--grid); border-radius: 8px; overflow: hidden; margin-bottom: 16px; background: var(--surface-1); }
+  .switcher button {
+    font: inherit; color: var(--text-secondary); background: none; border: 0; padding: 7px 14px; cursor: pointer;
+    border-left: 1px solid var(--grid);
+  }
+  .switcher button:first-child { border-left: 0; }
+  .switcher button[aria-pressed="true"] { color: var(--text-primary); font-weight: 600; box-shadow: inset 0 -2px 0 var(--accent); }
+  .switcher button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .tile { background: var(--surface-1); border: 1px solid var(--grid); border-radius: 8px; padding: 12px 14px; }
+  .tile .label { color: var(--text-secondary); font-size: 12px; }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .note { color: var(--text-muted); font-size: 12px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 520px), 1fr)); gap: 16px; }
+  .card { background: var(--surface-1); border: 1px solid var(--grid); border-radius: 8px; padding: 14px 14px 8px; position: relative; min-width: 0; }
+  .card h2 { font-size: 15px; margin: 0; }
+  .card .desc { color: var(--text-secondary); font-size: 12px; margin: 2px 0 8px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-secondary); margin-bottom: 4px; }
+  .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 12px; height: 3px; border-radius: 2px; display: inline-block; }
+  .rule-key { width: 0; height: 12px; border-left: 1px dashed var(--rule); display: inline-block; }
+  svg { display: block; width: 100%; overflow: visible; }
+  svg text { fill: var(--text-secondary); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .tip {
+    position: absolute; pointer-events: none; display: none; z-index: 2;
+    background: var(--surface-1); border: 1px solid var(--grid); border-radius: 6px;
+    box-shadow: 0 4px 14px rgb(0 0 0 / 0.14); padding: 8px 10px; font-size: 12px; min-width: 150px;
+  }
+  .tip .head { color: var(--text-secondary); margin-bottom: 4px; }
+  .tip .row { display: flex; align-items: center; gap: 6px; }
+  .tip .row b { margin-left: auto; padding-left: 12px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .compare { margin-top: 16px; }
+  .compare h2 { margin-bottom: 8px; }
+  .compare tr.current td { font-weight: 600; color: var(--text-primary); }
+  details { margin-top: 16px; background: var(--surface-1); border: 1px solid var(--grid); border-radius: 8px; padding: 10px 14px; }
+  summary { cursor: pointer; color: var(--text-secondary); }
+  .table-wrap { overflow-x: auto; }
+  details .table-wrap { margin-top: 10px; max-height: 420px; }
+  table { border-collapse: collapse; font-size: 12px; font-variant-numeric: tabular-nums; }
+  th, td { padding: 4px 10px; text-align: right; border-bottom: 1px solid var(--grid); white-space: nowrap; color: var(--text-secondary); }
+  th:first-child, td:first-child { text-align: left; }
+  th { font-weight: 600; position: sticky; top: 0; background: var(--surface-1); }
+</style>
+</head>
+<body>
+<main>
+  <h1>zinc-kv cluster timeline</h1>
+  <p class="sub" id="sub"></p>
+  <div class="switcher" role="group" aria-label="Scenario" id="switcher"></div>
+  <div class="tiles" id="tiles"></div>
+  <div class="grid" id="charts"></div>
+  <section class="card compare">
+    <h2>All scenarios</h2>
+    <p class="desc">Totals at the end of each run. Per-operation figures make runs of different lengths comparable.</p>
+    <div class="table-wrap"><table id="compare"></table></div>
+  </section>
+  <details>
+    <summary id="table-summary">Data table</summary>
+    <div class="table-wrap"><table id="table"></table></div>
+  </details>
+</main>
+<script>
+const RAW = String.raw`__DATA__`;
+
+// Opened as the bare template: no data was filled in.
+if (!RAW.trim().startsWith("{")) {
+  document.querySelector("main").innerHTML =
+    "<h1>No data in this file</h1><p class='sub'>This is the template. Run " +
+    "<code>cargo test --release --test timeline -- --ignored --nocapture</code> and open " +
+    "<code>target/tmp/timeline.html</code> in a browser.</p>";
+  throw new Error("timeline template opened without data");
+}
+const DATA = JSON.parse(RAW);
+
+function parse(csv) {
+  const lines = csv.trim().split(/\r?\n/);
+  const header = lines[0].split(",");
+  return lines.slice(1).map(line => {
+    const cells = line.split(",").map(Number);
+    return Object.fromEntries(header.map((h, i) => [h, cells[i]]));
+  });
+}
+
+const scenarios = DATA.scenarios.map(s => {
+  const rows = parse(s.csv);
+  // Per-interval rates: requests per operation completed in each sample interval.
+  const rates = rows.slice(1).map((r, i) => {
+    const p = rows[i];
+    const ops = Math.max(1, r.ops - p.ops);
+    const per = k => (r[k] - p[k]) / ops;
+    return { ops: r.ops, get: per("get"), head: per("head"), put: per("put"), list: per("list"), delete: per("delete") };
+  });
+  const cleanups = rows.slice(1).filter((r, i) => r.cleanups > rows[i].cleanups).map(r => r.ops);
+  const last = rows[rows.length - 1];
+  const peak = Math.max(...rows.map(r => r.storage_bytes));
+  const succeeded = last.gets + last.lists + last.creates + last.updates + last.deletes;
+  return { nodes: s.nodes, delay: s.delay, rows, rates, cleanups, last, peak, succeeded };
+});
+
+const bytes = v => v >= 1e6 ? (v / 1e6).toFixed(2) + " MB" : v >= 1e3 ? (v / 1e3).toFixed(1) + " KB" : Math.round(v) + " B";
+const count = v => Math.round(v).toLocaleString();
+const dollars = v => "$" + v.toFixed(v < 0.01 ? 5 : 4);
+const fixed2 = v => v.toFixed(2);
+const plural = n => `${n} node${n === 1 ? "" : "s"}`;
+const delayLabel = d => d === "0ns" ? "no delay" : `${d} per request`;
+const scenarioLabel = s => `${plural(s.nodes)} · ${s.delay === "0ns" ? "0 ms" : s.delay}`;
+
+const CHARTS = [
+  {
+    title: "Storage",
+    desc: "Bytes in the store, against the live data they hold.",
+    data: s => s.rows, format: bytes, labels: true,
+    series: [
+      { key: "storage_bytes", name: "Total" },
+      { key: "checkpoint_bytes", name: "Checkpoints" },
+      { key: "log_bytes", name: "Commit log" },
+      { key: "live_bytes", name: "Live data" },
+    ],
+  },
+  {
+    title: "Requests per operation",
+    desc: "Each kind of request, per operation completed in the interval.",
+    data: s => s.rates, format: fixed2, labels: false,
+    series: [
+      { key: "get", name: "GET" },
+      { key: "head", name: "HEAD" },
+      { key: "put", name: "PUT" },
+      { key: "list", name: "LIST" },
+      { key: "delete", name: "DELETE" },
+    ],
+  },
+  {
+    title: "Estimated S3 cost",
+    desc: `Cumulative request cost at ${DATA.model} prices.`,
+    data: s => s.rows, format: dollars, labels: false,
+    series: [{ key: "cost_usd", name: "Cost" }],
+  },
+  {
+    title: "Failed operations",
+    desc: "Cumulative operations that ended in an error the caller retries.",
+    data: s => s.rows, format: count, labels: true,
+    series: [
+      { key: "conflicts", name: "Conflict" },
+      { key: "expired", name: "Expired" },
+      { key: "contention", name: "Contention" },
+    ],
+  },
+];
+
+const NS = "http://www.w3.org/2000/svg";
+const el = (tag, attrs = {}, parent) => {
+  const node = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) node.setAttribute(k, v);
+  if (parent) parent.appendChild(node);
+  return node;
+};
+const color = i => `var(--series-${i + 1})`;
+
+function niceMax(v) {
+  if (v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+
+function render(card, chart, scenario) {
+  const svg = card.querySelector("svg");
+  svg.innerHTML = "";
+  const W = svg.clientWidth || 520, H = 230;
+  const m = { l: 64, r: chart.labels ? 92 : 14, t: 10, b: 26 };
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  svg.setAttribute("height", H);
+  const data = chart.data(scenario);
+  const x0 = data[0].ops, x1 = data[data.length - 1].ops;
+  const yMax = niceMax(Math.max(...chart.series.flatMap(s => data.map(d => d[s.key]))) * 1.05);
+  const X = v => m.l + (v - x0) / Math.max(1, x1 - x0) * (W - m.l - m.r);
+  const Y = v => H - m.b - v / yMax * (H - m.t - m.b);
+
+  for (let i = 0; i <= 4; i++) {
+    const v = yMax * i / 4, y = Y(v);
+    el("line", { x1: m.l, x2: W - m.r, y1: y, y2: y, stroke: "var(--grid)", "stroke-width": 1 }, svg);
+    el("text", { x: m.l - 8, y: y + 4, "text-anchor": "end" }, svg).textContent = chart.format(v);
+  }
+  const xTicks = 5;
+  for (let i = 0; i <= xTicks; i++) {
+    const v = x0 + (x1 - x0) * i / xTicks;
+    el("text", { x: X(v), y: H - 8, "text-anchor": i === 0 ? "start" : i === xTicks ? "end" : "middle" }, svg)
+      .textContent = count(v);
+  }
+  for (const c of scenario.cleanups) {
+    el("line", { x1: X(c), x2: X(c), y1: m.t, y2: H - m.b, stroke: "var(--rule)", "stroke-dasharray": "3 3", "stroke-width": 1 }, svg);
+  }
+  chart.series.forEach((s, i) => {
+    const d = data.map((p, j) => `${j ? "L" : "M"}${X(p.ops).toFixed(1)},${Y(p[s.key]).toFixed(1)}`).join("");
+    el("path", { d, fill: "none", stroke: color(i), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  });
+
+  // Direct labels at the line ends, pushed apart so they never overlap.
+  if (chart.labels) {
+    const end = data[data.length - 1];
+    const placed = chart.series.map((s, i) => ({ i, name: s.name, y: Y(end[s.key]) })).sort((a, b) => a.y - b.y);
+    for (let k = 1; k < placed.length; k++) placed[k].y = Math.max(placed[k].y, placed[k - 1].y + 14);
+    // Out of room at the bottom: push back up.
+    const floor = H - m.b;
+    for (let k = placed.length - 1; k >= 0; k--) {
+      const limit = k === placed.length - 1 ? floor : placed[k + 1].y - 14;
+      placed[k].y = Math.min(placed[k].y, limit);
+    }
+    for (const p of placed) {
+      el("line", { x1: W - m.r + 6, x2: W - m.r + 16, y1: p.y, y2: p.y, stroke: color(p.i), "stroke-width": 2, "stroke-linecap": "round" }, svg);
+      el("text", { x: W - m.r + 20, y: p.y + 4 }, svg).textContent = p.name;
+    }
+  }
+
+  // Hover: crosshair, ringed markers, tooltip with every series at that point.
+  const cross = el("line", { y1: m.t, y2: H - m.b, stroke: "var(--text-muted)", "stroke-width": 1, visibility: "hidden" }, svg);
+  const dots = chart.series.map((s, i) => el("circle", { r: 4.5, fill: color(i), stroke: "var(--surface-1)", "stroke-width": 2, visibility: "hidden" }, svg));
+  const hit = el("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" }, svg);
+  const tip = card.querySelector(".tip");
+  const hide = () => { tip.style.display = "none"; cross.setAttribute("visibility", "hidden"); dots.forEach(d => d.setAttribute("visibility", "hidden")); };
+  hide();
+  hit.addEventListener("pointerleave", hide);
+  hit.addEventListener("pointermove", ev => {
+    const box = svg.getBoundingClientRect();
+    const px = (ev.clientX - box.left) * W / box.width;
+    let j = 0;
+    for (let k = 1; k < data.length; k++) if (Math.abs(X(data[k].ops) - px) < Math.abs(X(data[j].ops) - px)) j = k;
+    const p = data[j], cx = X(p.ops);
+    cross.setAttribute("x1", cx); cross.setAttribute("x2", cx); cross.setAttribute("visibility", "visible");
+    chart.series.forEach((s, i) => { dots[i].setAttribute("cx", cx); dots[i].setAttribute("cy", Y(p[s.key])); dots[i].setAttribute("visibility", "visible"); });
+    const prev = j ? data[j - 1].ops : 0;
+    const cleaned = scenario.cleanups.some(c => c > prev && c <= p.ops);
+    tip.innerHTML = `<div class="head">${count(p.ops)} operations${cleaned ? " · cleanup ran" : ""}</div>` +
+      chart.series.map((s, i) => `<div class="row"><span class="swatch" style="background:${color(i)}"></span>${s.name}<b>${chart.format(p[s.key])}</b></div>`).join("");
+    tip.style.display = "block";
+    const cardBox = card.getBoundingClientRect();
+    const left = ev.clientX - cardBox.left;
+    tip.style.left = Math.min(left + 14, cardBox.width - tip.offsetWidth - 8) + "px";
+    tip.style.top = (ev.clientY - cardBox.top + 14) + "px";
+  });
+}
+
+const container = document.getElementById("charts");
+const cards = CHARTS.map(chart => {
+  const card = document.createElement("section");
+  card.className = "card";
+  const legend = chart.series.length > 1
+    ? `<div class="legend">${chart.series.map((s, i) => `<span><i class="swatch" style="background:${color(i)}"></i>${s.name}</span>`).join("")}<span><i class="rule-key"></i>Cleanup</span></div>`
+    : `<div class="legend"><span><i class="rule-key"></i>Cleanup</span></div>`;
+  card.innerHTML = `<h2>${chart.title}</h2><p class="desc">${chart.desc}</p>${legend}<svg role="img" aria-label="${chart.title}"></svg><div class="tip"></div>`;
+  container.appendChild(card);
+  return [card, chart];
+});
+
+function tilesFor(s) {
+  const last = s.last;
+  return [
+    ["Operations", count(last.ops), `${count(s.succeeded)} succeeded`],
+    ["Requests", count(last.requests), `${(last.requests / last.ops).toFixed(1)} per operation`],
+    ["Estimated S3 cost", dollars(last.cost_usd), `${dollars(last.cost_usd / last.ops * 1e6)} per million ops`],
+    ["Peak storage", bytes(s.peak), `${(s.peak / Math.max(1, last.live_bytes)).toFixed(1)}× final live data`],
+    ["Conflicts", count(last.conflicts), `${(100 * last.conflicts / last.ops).toFixed(1)}% of operations`],
+    ["Busiest node", last.est_busy_s.toFixed(1) + " s", "estimated time in requests"],
+  ];
+}
+
+const TABLE_COLUMNS = ["ops", "requests", "cost_usd", "storage_bytes", "checkpoint_bytes", "log_bytes", "live_bytes", "live_keys", "conflicts", "expired", "contention", "cleanups"];
+let current = scenarios.length - 1;
+
+function show(index) {
+  current = index;
+  const s = scenarios[index];
+  document.getElementById("sub").textContent =
+    `${plural(s.nodes)} × ${count(DATA.ops_per_node)} random operations on ${DATA.keys} keys, cleanup every ` +
+    `${count(DATA.cleanup_every)} operations with ${DATA.retention} retention, ${delayLabel(s.delay)}. ` +
+    `Costs and times are estimates from request counts (${DATA.model}).`;
+  document.querySelectorAll("#switcher button").forEach((b, i) => b.setAttribute("aria-pressed", String(i === index)));
+  document.getElementById("tiles").innerHTML = tilesFor(s).map(([label, value, note]) =>
+    `<div class="tile"><div class="label">${label}</div><div class="value">${value}</div><div class="note">${note}</div></div>`).join("");
+  cards.forEach(([card, chart]) => render(card, chart, s));
+  document.querySelectorAll("#compare tbody tr").forEach((tr, i) => tr.classList.toggle("current", i === index));
+  document.getElementById("table-summary").textContent = `Data table · ${scenarioLabel(s)}`;
+  document.getElementById("table").innerHTML =
+    `<thead><tr>${TABLE_COLUMNS.map(c => `<th>${c}</th>`).join("")}</tr></thead><tbody>` +
+    s.rows.map(r => `<tr>${TABLE_COLUMNS.map(c => `<td>${c === "cost_usd" ? r[c].toFixed(6) : count(r[c])}</td>`).join("")}</tr>`).join("") +
+    "</tbody>";
+}
+
+document.getElementById("switcher").innerHTML = scenarios.map((s, i) =>
+  `<button type="button" data-i="${i}">${scenarioLabel(s)}</button>`).join("");
+document.getElementById("switcher").addEventListener("click", ev => {
+  const button = ev.target.closest("button");
+  if (button) show(Number(button.dataset.i));
+});
+
+const COMPARE = [
+  ["Nodes", s => plural(s.nodes)],
+  ["Request delay", s => s.delay === "0ns" ? "none" : s.delay],
+  ["Operations", s => count(s.last.ops)],
+  ["Requests / op", s => (s.last.requests / s.last.ops).toFixed(2)],
+  ["LIST / op", s => (s.last.list / s.last.ops).toFixed(2)],
+  ["GET / op", s => (s.last.get / s.last.ops).toFixed(2)],
+  ["$ / million ops", s => dollars(s.last.cost_usd / s.last.ops * 1e6)],
+  ["Peak storage", s => bytes(s.peak)],
+  ["Storage ÷ live", s => (s.peak / Math.max(1, s.last.live_bytes)).toFixed(1) + "×"],
+  ["Conflicts", s => (100 * s.last.conflicts / s.last.ops).toFixed(1) + "%"],
+  ["Expired", s => count(s.last.expired)],
+  ["Busiest node", s => s.last.est_busy_s.toFixed(1) + " s"],
+];
+document.getElementById("compare").innerHTML =
+  `<thead><tr>${COMPARE.map(([h]) => `<th>${h}</th>`).join("")}</tr></thead><tbody>` +
+  scenarios.map(s => `<tr>${COMPARE.map(([, f]) => `<td>${f(s)}</td>`).join("")}</tr>`).join("") +
+  "</tbody>";
+
+show(current);
+let pending;
+window.addEventListener("resize", () => { cancelAnimationFrame(pending); pending = requestAnimationFrame(() => show(current)); });
+</script>
+</body>
+</html>
